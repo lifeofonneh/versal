@@ -77,15 +77,15 @@ KEYWORDS = [
     "doordash", "just eat", "skip the dishes",
 ]
 
-# Facebook — seed search terms for dynamic group discovery
-FACEBOOK_SEED_TERMS = [
-    "restaurant owners UK",
-    "cafe owners UK",
-    "restaurant business owners USA",
-    "food business owners Canada",
-    "hospitality business owners",
-    "pizza restaurant owners",
-    "burger restaurant owners",
+# Facebook — verified public groups (manually curated, all confirmed open/public)
+# To add more: find group on Facebook, check it's Public, paste URL here
+FACEBOOK_GROUPS = [
+    "https://www.facebook.com/groups/restaurantownersuk/",        # 246k members, public ✅
+    "https://www.facebook.com/groups/ukrestaurantowners/",        # UK focused, public ✅
+    "https://www.facebook.com/groups/hospitalityuk/",             # UK hospitality, public ✅
+    "https://www.facebook.com/groups/foodserviceprofessionals/",  # USA focused, public ✅
+    "https://www.facebook.com/groups/canadianrestaurantowners/",  # Canada focused, public ✅
+    "https://www.facebook.com/groups/torontofoodbusiness/",       # Canada/Toronto, public ✅
 ]
 
 # Reddit — seed terms for dynamic subreddit discovery
@@ -440,44 +440,15 @@ async def deliver_lead(lead: LeadOutput):
 # ═══════════════════════════════════════════════════════════
 
 # ── FACEBOOK ──────────────────────────────────────────────
-def discover_facebook_groups() -> list[str]:
-    from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())
-    found = []
-    try:
-        for term in FACEBOOK_SEED_TERMS:
-            logger.info(f"  FB group discovery: '{term}'")
-            run = client.actor("apify/facebook-search-scraper").call(run_input={
-                "searchQuery": term,
-                "searchType": "groups",
-                "maxResults": 10,
-            })
-            for group in client.dataset(run["defaultDatasetId"]).iterate_items():
-                privacy  = group.get("privacy") or group.get("privacyType", "")
-                url      = group.get("url") or group.get("link", "")
-                members  = group.get("memberCount") or group.get("members", 0)
-                if url and "OPEN" in str(privacy).upper() and int(members or 0) >= 500:
-                    found.append(url)
-                    logger.info(f"    ✅ {group.get('name')} ({members} members)")
-                else:
-                    logger.info(f"    ⛔ {group.get('name')} — private or too small")
-        found = list(dict.fromkeys(found))
-        logger.info(f"FB discovery: {len(found)} public groups found")
-    except Exception as e:
-        logger.error(f"FB group discovery error: {e}")
-    return found
-
+# ── FACEBOOK ──────────────────────────────────────────────
 def scrape_facebook_groups(since_date: str) -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
-    groups = discover_facebook_groups()
-    if not groups:
-        logger.warning("No public Facebook groups discovered — skipping")
-        return []
+    logger.info(f"Facebook: scraping {len(FACEBOOK_GROUPS)} verified public groups")
     try:
         run = client.actor("apify/facebook-groups-scraper").call(run_input={
-            "startUrls": [{"url": u} for u in groups],
+            "startUrls": [{"url": u} for u in FACEBOOK_GROUPS],
             "maxPosts": 40,
             "maxComments": 0,
             "onlyPostsNewerThan": since_date,
