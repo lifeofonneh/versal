@@ -447,8 +447,9 @@ def discover_facebook_groups() -> list[str]:
     try:
         for term in FACEBOOK_SEED_TERMS:
             logger.info(f"  FB group discovery: '{term}'")
-            run = client.actor("apify/facebook-groups-search").call(run_input={
+            run = client.actor("apify/facebook-search-scraper").call(run_input={
                 "searchQuery": term,
+                "searchType": "groups",
                 "maxResults": 10,
             })
             for group in client.dataset(run["defaultDatasetId"]).iterate_items():
@@ -492,6 +493,13 @@ def scrape_facebook_groups(since_date: str) -> list[dict]:
     return items
 
 # ── REDDIT ────────────────────────────────────────────────
+# Keywords that must appear in the subreddit name or description to be included
+REDDIT_RELEVANCE_KEYWORDS = [
+    "restaurant", "cafe", "food", "hospitality", "kitchen", "chef",
+    "bar", "diner", "barista", "small business", "entrepreneur", "canada business",
+    "uk business", "pizza", "burger", "server", "waiter",
+]
+
 def discover_subreddits() -> list[str]:
     found, seen = [], set()
     headers = {"User-Agent": "VersalLeadBot/1.0"}
@@ -508,10 +516,16 @@ def discover_subreddits() -> list[str]:
                 name = d.get("display_name", "")
                 subs = d.get("subscribers", 0)
                 kind = d.get("subreddit_type", "")
-                if name and name not in seen and kind == "public" and subs >= 1000:
+                desc = (d.get("public_description", "") + " " + d.get("display_name", "")).lower()
+                # Must be public, 1k+ subs, AND actually relevant to food/restaurant/business
+                relevant = any(kw in desc for kw in REDDIT_RELEVANCE_KEYWORDS)
+                if name and name not in seen and kind == "public" and subs >= 1000 and relevant:
                     found.append(name)
                     seen.add(name)
                     logger.info(f"  ✅ r/{name} ({subs:,} subscribers)")
+                else:
+                    if name and name not in seen:
+                        logger.info(f"  ⛔ r/{name} — not relevant enough, skipping")
             time.sleep(1)
         except Exception as e:
             logger.error(f"Subreddit discovery error for '{term}': {e}")
