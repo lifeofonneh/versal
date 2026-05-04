@@ -465,7 +465,7 @@ def scrape_facebook_groups() -> list[dict]:
 # ── 2. REDDIT  ★★★★★ ──────────────────────────────────────
 def scrape_reddit() -> list[dict]:
     from apify_client import ApifyClient
-    client = ApifyClient(APIFY_TOKEN)
+    client = ApifyClient(get_apify_token())  # fixed: was APIFY_TOKEN
     items = []
     try:
         for sub in REDDIT_SUBREDDITS:
@@ -493,7 +493,7 @@ def scrape_reddit() -> list[dict]:
 # Caption "trying to grow this 😭" + 47 views = perfect lead
 def scrape_tiktok() -> list[dict]:
     from apify_client import ApifyClient
-    client = ApifyClient(APIFY_TOKEN)
+    client = ApifyClient(get_apify_token())  # fixed: was APIFY_TOKEN
     items = []
     try:
         for hashtag in TIKTOK_HASHTAGS:
@@ -597,7 +597,7 @@ def scrape_trustpilot() -> list[dict]:
 def scrape_instagram() -> list[dict]:
     from apify_client import ApifyClient
     from datetime import timedelta
-    client = ApifyClient(APIFY_TOKEN)
+    client = ApifyClient(get_apify_token())  # fixed: was APIFY_TOKEN
     items  = []
     cutoff = datetime.now(timezone.utc) - timedelta(days=INSTAGRAM_MAX_AGE_DAYS)
     try:
@@ -674,7 +674,16 @@ def scrape_yelp() -> list[dict]:
 # ═══════════════════════════════════════════════════════════
 # MASTER PIPELINE
 # ═══════════════════════════════════════════════════════════
+_pipeline_lock = asyncio.Lock()
+
 async def run_pipeline(test_mode: bool = False):
+    if _pipeline_lock.locked():
+        logger.warning("⚠️  Pipeline already running — skipping duplicate /run call")
+        return {"skipped": True, "reason": "pipeline already in progress"}
+    async with _pipeline_lock:
+        return await _run_pipeline_inner(test_mode)
+
+async def _run_pipeline_inner(test_mode: bool = False):
     start = time.monotonic()
     logger.info("=" * 60)
     logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v3")
