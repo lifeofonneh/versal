@@ -3,3 +3,5 @@ httpx
 pydantic
 google-genai
 python-dotenv
+flask
+gunicorn
