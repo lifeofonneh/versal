@@ -1,0 +1,5 @@
+apify-client
+httpx
+pydantic
+google-genai
+python-dotenv
