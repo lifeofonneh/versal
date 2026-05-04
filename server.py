@@ -1,24 +1,33 @@
-"""
-Tiny Flask server — cron-job.org hits /run and triggers the pipeline.
-Deploy this as a Render Web Service (free tier).
-"""
-
-import asyncio, threading
+import threading
 from flask import Flask, jsonify
 from versal_pipeline import run_pipeline
+import asyncio
 
 app = Flask(__name__)
 
+_running = False  # simple flag — prevents stacking runs
+
 @app.route("/")
 def index():
-    return jsonify({"status": "Versal Lead Machine is alive ✅"})
+    return "Versal Lead Machine is live.", 200
 
 @app.route("/run")
 def run():
-    def background():
-        asyncio.run(run_pipeline(test_mode=False))
-    threading.Thread(target=background).start()
-    return jsonify({"status": "Pipeline started ✅"})
+    global _running
+    if _running:
+        return jsonify({"status": "skipped", "reason": "pipeline already running"}), 200
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    def background():
+        global _running
+        _running = True
+        try:
+            asyncio.run(run_pipeline(test_mode=False))
+        finally:
+            _running = False
+
+    threading.Thread(target=background, daemon=True).start()
+    return jsonify({"status": "started"}), 200
+
+@app.route("/status")
+def status():
+    return jsonify({"running": _running}), 200
