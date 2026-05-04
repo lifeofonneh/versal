@@ -3,16 +3,10 @@ Versal Digital Solutions — Lean Lead Machine v3
 Platforms: Reddit, Facebook Groups, TikTok, Google Reviews, TrustPilot
 Markets:   USA · UK · Canada
 Leads → Slack (copy-paste ready) + Supabase + Make.com
-
-DROPPED: LinkedIn, Twitter/X, Instagram comments (low signal / credit waste)
-ADDED:   TikTok hashtag + low-view video scraping (live proof they need Versal)
-
-Install: pip install apify-client httpx pydantic google-genai
-Run:     python versal_pipeline.py
 """
 
 import asyncio, json, httpx, os, time, logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from pydantic import BaseModel, Field
 from google import genai
@@ -24,29 +18,22 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════
 # CREDENTIALS
 # ═══════════════════════════════════════════════════════════
-# ── Apify key rotation (add as many keys as you like) ──────
-# Reads from Render environment variables — fallback to hardcoded for local testing
 def _load_apify_tokens() -> list[str]:
-    import os
-    # Check for individually named env vars first (APIFY_TOKEN_1 ... APIFY_TOKEN_7)
     env_keys = [os.getenv(f"APIFY_TOKEN_{i}") for i in range(1, 8)]
     env_keys = [k for k in env_keys if k]
     if env_keys:
         return env_keys
-    # Fallback: hardcoded (safe for local runs, not pushed to GitHub ideally)
-    # No hardcoded tokens — set APIFY_TOKEN_1 ... APIFY_TOKEN_N in your environment
-    raise ValueError(
-        "No Apify tokens found. Set APIFY_TOKEN_1, APIFY_TOKEN_2, ... "
-        "as environment variables (Render dashboard, .env file, or shell export)."
-    )
+    raise ValueError("No Apify tokens found. Set APIFY_TOKEN_1 ... APIFY_TOKEN_N as env vars.")
 
 APIFY_TOKENS = _load_apify_tokens()
 _apify_index = 0
+
 def get_apify_token() -> str:
     global _apify_index
     token = APIFY_TOKENS[_apify_index % len(APIFY_TOKENS)]
     _apify_index += 1
     return token
+
 def _require_env(name: str) -> str:
     val = os.getenv(name)
     if not val:
@@ -80,13 +67,6 @@ Tone: Peer-to-peer, genuinely helpful, NEVER salesy. Lead with a tip. End with t
 # ═══════════════════════════════════════════════════════════
 # TARGET LISTS
 # ═══════════════════════════════════════════════════════════
-
-# Reddit — seed terms used to discover subreddits dynamically
-REDDIT_SEED_TERMS = [
-    "restaurant owner", "cafe owner", "food business",
-    "hospitality UK", "restaurant business Canada",
-]
-
 KEYWORDS = [
     "staffing", "food costs", "hiring", "slow season", "losing money",
     "bad reviews", "social media help", "marketing help", "no customers",
@@ -97,7 +77,7 @@ KEYWORDS = [
     "doordash", "just eat", "skip the dishes",
 ]
 
-# Facebook — seed search terms used to discover public groups dynamically
+# Facebook — seed search terms for dynamic group discovery
 FACEBOOK_SEED_TERMS = [
     "restaurant owners UK",
     "cafe owners UK",
@@ -108,57 +88,48 @@ FACEBOOK_SEED_TERMS = [
     "burger restaurant owners",
 ]
 
-# Instagram — low-view Reels from restaurant accounts (≤100 views, 2-3 days old)
-# Same logic as TikTok — low views = live proof they need Versal
-INSTAGRAM_HASHTAGS = [
-    "restaurantowner",
-    "cafeowner",
-    "smallrestaurant",
-    "restaurantlife",
-    "foodbusiness",
-    "pizzarestaurant",
-    "burgerrestaurant",
+# Reddit — seed terms for dynamic subreddit discovery
+REDDIT_SEED_TERMS = [
+    "restaurant owner",
+    "cafe owner",
+    "food business",
+    "hospitality UK",
+    "restaurant business Canada",
 ]
-INSTAGRAM_MAX_VIEWS    = 100   # only surface Reels under this view count
-INSTAGRAM_MAX_AGE_DAYS = 3     # only surface posts newer than this (fresh pain)
 
-# TikTok — low-view restaurant videos = live proof they need Versal
-# Caption "trying to grow this account 😭" with 47 views is a perfect lead
+# TikTok hashtags
 TIKTOK_HASHTAGS = [
-    "restaurantowner",
-    "smallrestaurant",
-    "restaurantlife",
-    "cafeowner",
-    "foodbusiness",
-    "restauranttok",
+    "restaurantowner", "smallrestaurant", "restaurantlife",
+    "cafeowner", "foodbusiness", "restauranttok",
 ]
-# View threshold — only surface videos under this count (struggling accounts)
 TIKTOK_MAX_VIEWS = 500
 
-# TrustPilot — UK-heavy, run 1x/week (not 3x) to stay inside budget
+# Instagram hashtags
+INSTAGRAM_HASHTAGS = [
+    "restaurantowner", "cafeowner", "smallrestaurant",
+    "restaurantlife", "foodbusiness", "pizzarestaurant", "burgerrestaurant",
+]
+INSTAGRAM_MAX_VIEWS    = 100
+INSTAGRAM_MAX_AGE_DAYS = 3
+
+# TrustPilot
 TRUSTPILOT_CATEGORIES = [
     "https://uk.trustpilot.com/categories/restaurants_bars",
     "https://www.trustpilot.com/categories/restaurants_bars",
 ]
 
-# Google Maps — low-rated restaurants = owner in pain, great cold outreach angle
+# Google Maps
 GOOGLE_MAPS_QUERIES = [
-    "pizza restaurant London",
-    "burger restaurant Manchester",
-    "cafe Birmingham",
-    "pizza restaurant New York",
-    "burger restaurant Los Angeles",
-    "cafe Toronto",
-    "pizza restaurant Vancouver",
+    "pizza restaurant London", "burger restaurant Manchester", "cafe Birmingham",
+    "pizza restaurant New York", "burger restaurant Los Angeles",
+    "cafe Toronto", "pizza restaurant Vancouver",
 ]
 
-# Yelp (optional — add specific restaurant URLs to activate)
+# Yelp (add specific restaurant URLs to activate)
 YELP_RESTAURANTS: list[str] = []
 
-
 # ═══════════════════════════════════════════════════════════
-# ACTIVE PLATFORMS  —  flip True/False to enable/disable
-# Start with Facebook + Reddit to validate, then add the rest
+# ACTIVE PLATFORMS
 # ═══════════════════════════════════════════════════════════
 ACTIVE_PLATFORMS = {
     "facebook":   True,
@@ -169,21 +140,6 @@ ACTIVE_PLATFORMS = {
     "trustpilot": False,
     "yelp":       True,
 }
-
-# ═══════════════════════════════════════════════════════════
-# MONTHLY CREDIT BUDGET (~$79/month target)
-# Facebook Groups  3x/week  ~360K credits  ~$36
-# Reddit           3x/week  ~180K credits  ~$18
-# TikTok           3x/week  ~120K credits  ~$12
-# Instagram        3x/week  ~120K credits  ~$12
-# Google Reviews   3x/week  ~120K credits  ~$12
-# TrustPilot       1x/week   ~60K credits  ~ $6
-# Yelp             1x/week   ~40K credits  ~ $4
-# ─────────────────────────────────────────  ────
-# TOTAL (all on)            ~1000K credits ~$100
-# RECOMMENDED START         Facebook+Reddit only → ~$54/month
-# ═══════════════════════════════════════════════════════════
-
 
 # ═══════════════════════════════════════════════════════════
 # PYDANTIC MODEL
@@ -199,10 +155,9 @@ class LeadOutput(BaseModel):
     drafted_response: str
     free_resource_offered: str
     market: str
-    tiktok_view_count: Optional[int] = None   # populated for TikTok leads
+    tiktok_view_count: Optional[int] = None
     processed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     passed_threshold: bool
-
 
 # ═══════════════════════════════════════════════════════════
 # GEMINI AI ENGINE
@@ -230,18 +185,9 @@ a done-for-you short-form content agency for restaurants in the USA, UK, and Can
 Analyse this {platform} post/comment/video. Return ONLY valid JSON.
 
 Is the author a restaurant OWNER/OPERATOR (not a diner, not staff)?
-Intent score 0-100 — urgency of need for social media / marketing / visibility help:
-90-100: actively asking for help, mentions poor social media, low views, no customers
-70-89: clear owner pain point around visibility or growth
-50-69: owner venting, not actively seeking help yet
-0-49: diner complaint, spam, staff member, unrelated
+Intent score 0-100 — urgency of need for social media / marketing / visibility help.
 
-For TikTok: a restaurant owner with under 500 views automatically starts at 70+
-if the caption references growth, views, or struggle.
-
-Detect market: "USA", "UK", "Canada", or "Unknown" from context clues
-(currency, delivery apps mentioned — Just Eat/Deliveroo=UK, Skip The Dishes=Canada,
-DoorDash/Grubhub=USA; location mentions; spelling).
+Detect market: "USA", "UK", "Canada", or "Unknown".
 
 Return ONLY: {{"is_restaurant_owner": true/false, "intent_score": 0-100,
 "market": "USA|UK|Canada|Unknown", "reasoning": "one sentence"}}
@@ -271,7 +217,7 @@ def draft_response(text: str, category: str, pain_point: str,
 
     tiktok_note = ""
     if platform == "tiktok" and tiktok_views is not None:
-        tiktok_note = f"\nThis is a TikTok video with only {tiktok_views} views. Reference this naturally — e.g. 'I came across your video' — without being creepy about the view count."
+        tiktok_note = f"\nThis is a TikTok video with only {tiktok_views} views."
 
     platform_tone = {
         "reddit":     "casual Reddit reply, peer-to-peer, no formality",
@@ -282,8 +228,7 @@ def draft_response(text: str, category: str, pain_point: str,
         "google":     "empathetic cold outreach email referencing their Google presence",
     }.get(platform, "friendly helpful message")
 
-    return ask_gemini(f"""You represent Versal Digital Solutions — a done-for-you
-short-form video content agency for restaurants (USA, UK, Canada).
+    return ask_gemini(f"""You represent Versal Digital Solutions.
 
 {AGENCY_CONTEXT}
 {market_note}{tiktok_note}
@@ -294,13 +239,12 @@ Rules:
 - Max 3 sentences. Sound like a helpful peer, NOT an agency.
 - Lead with ONE specific actionable tip related to their exact problem.
 - End naturally by offering Versal's free mini-audit (no commitment, 2 mins to apply).
-- Never mention pricing. Never be pushy. Be genuinely helpful.
-- Reference their specific problem so it feels personal, not templated.
+- Never mention pricing. Never be pushy.
 
 Return ONLY: {{"drafted_response": "the reply text",
 "free_resource_offered": "Free Versal Mini-Audit + 15-min Strategy Call"}}
 
-Their post/caption: {text[:400]}""")
+Their post: {text[:400]}""")
 
 def process_single_lead(text: str, platform: str, url: str,
                         threshold: int = 75,
@@ -320,7 +264,6 @@ def process_single_lead(text: str, platform: str, url: str,
     if not classification: return None
     category   = classification.get("problem_category", "Other")
     pain_point = classification.get("pain_point_summary", "")
-    logger.info(f"  Category: {category} | {pain_point}")
 
     draft = draft_response(text, category, pain_point, platform, market, tiktok_views)
     if not draft: return None
@@ -334,6 +277,64 @@ def process_single_lead(text: str, platform: str, url: str,
         market=market, tiktok_view_count=tiktok_views, passed_threshold=True,
     )
 
+# ═══════════════════════════════════════════════════════════
+# DEDUP
+# ═══════════════════════════════════════════════════════════
+async def load_seen_urls() -> set[str]:
+    try:
+        async with httpx.AsyncClient() as client:
+            headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            seen, offset = set(), 0
+            while True:
+                r = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/leads",
+                    headers=headers,
+                    params={"select": "source_url", "limit": 1000, "offset": offset},
+                    timeout=15,
+                )
+                rows = r.json()
+                if not rows:
+                    break
+                seen.update(row["source_url"] for row in rows if row.get("source_url"))
+                if len(rows) < 1000:
+                    break
+                offset += 1000
+            logger.info(f"Dedup: loaded {len(seen)} previously seen URLs")
+            return seen
+    except Exception as e:
+        logger.error(f"Dedup load error: {e}")
+        return set()
+
+def is_new(url: str, seen: set[str]) -> bool:
+    if not url or url in seen:
+        return False
+    seen.add(url)
+    return True
+
+# ═══════════════════════════════════════════════════════════
+# LAST RUN DATE
+# ═══════════════════════════════════════════════════════════
+async def get_last_run_date() -> str:
+    fallback = (datetime.now(timezone.utc) - timedelta(days=50)).strftime("%Y-%m-%d")
+    try:
+        async with httpx.AsyncClient() as client:
+            headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/leads",
+                headers=headers,
+                params={"select": "processed_at", "order": "processed_at.desc", "limit": 1},
+                timeout=10,
+            )
+            rows = r.json()
+            if rows and rows[0].get("processed_at"):
+                last_date = rows[0]["processed_at"][:10]
+                logger.info(f"📅 Existing leads found — scraping since: {last_date}")
+                return last_date
+            logger.info(f"🆕 First ever run — scraping last 50 days since: {fallback}")
+            return fallback
+    except Exception as e:
+        logger.error(f"Could not fetch last run date, using 50-day fallback: {e}")
+        return fallback
 
 # ═══════════════════════════════════════════════════════════
 # DELIVERY
@@ -352,7 +353,7 @@ async def send_to_slack(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
     }.get(lead.source_platform, lead.source_platform.upper())
 
     flag = MARKET_FLAG.get(lead.market, "🌍")
-    tiktok_views_text = f"\n*👁 TikTok Views:* {lead.tiktok_view_count}" if lead.tiktok_view_count is not None else ""
+    tiktok_text = f"\n*👁 TikTok Views:* {lead.tiktok_view_count}" if lead.tiktok_view_count is not None else ""
 
     blocks = [
         {"type": "header", "text": {"type": "plain_text",
@@ -362,7 +363,7 @@ async def send_to_slack(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
             {"type": "mrkdwn", "text": f"*Problem:*\n{lead.problem_category}"},
         ]},
         {"type": "section", "text": {"type": "mrkdwn",
-            "text": f"*Pain Point:*\n{lead.pain_point_summary}{tiktok_views_text}"}},
+            "text": f"*Pain Point:*\n{lead.pain_point_summary}{tiktok_text}"}},
         {"type": "section", "text": {"type": "mrkdwn",
             "text": f"*📋 Copy-paste this reply:*\n```{lead.drafted_response}```"}},
         {"type": "section", "text": {"type": "mrkdwn",
@@ -376,7 +377,8 @@ async def send_to_slack(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
         r = await client.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=15)
         return r.status_code < 300
     except Exception as e:
-        logger.error(f"Slack error: {e}"); return False
+        logger.error(f"Slack error: {e}")
+        return False
 
 async def send_to_make(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
     payload = {
@@ -395,7 +397,8 @@ async def send_to_make(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
         r = await client.post(MAKE_WEBHOOK_URL, json=payload, timeout=15)
         return r.status_code < 300
     except Exception as e:
-        logger.error(f"Make.com error: {e}"); return False
+        logger.error(f"Make.com error: {e}")
+        return False
 
 async def save_to_supabase(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
     headers = {
@@ -422,7 +425,8 @@ async def save_to_supabase(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
                               json=record, timeout=15)
         return r.status_code in (200, 201)
     except Exception as e:
-        logger.error(f"Supabase error: {e}"); return False
+        logger.error(f"Supabase error: {e}")
+        return False
 
 async def deliver_lead(lead: LeadOutput):
     async with httpx.AsyncClient() as client:
@@ -431,22 +435,51 @@ async def deliver_lead(lead: LeadOutput):
         supa  = await save_to_supabase(client, lead)
         logger.info(f"  Delivered → Slack:{slack} | Make:{make} | Supabase:{supa}")
 
-
 # ═══════════════════════════════════════════════════════════
-# SCRAPERS  (5 platforms — lean & high-signal only)
+# SCRAPERS
 # ═══════════════════════════════════════════════════════════
 
-# ── 1. FACEBOOK GROUPS  ★★★★★ ─────────────────────────────
+# ── FACEBOOK ──────────────────────────────────────────────
+def discover_facebook_groups() -> list[str]:
+    from apify_client import ApifyClient
+    client = ApifyClient(get_apify_token())
+    found = []
+    try:
+        for term in FACEBOOK_SEED_TERMS:
+            logger.info(f"  FB group discovery: '{term}'")
+            run = client.actor("apify/facebook-groups-search").call(run_input={
+                "searchQuery": term,
+                "maxResults": 10,
+            })
+            for group in client.dataset(run["defaultDatasetId"]).iterate_items():
+                privacy  = group.get("privacy") or group.get("privacyType", "")
+                url      = group.get("url") or group.get("link", "")
+                members  = group.get("memberCount") or group.get("members", 0)
+                if url and "OPEN" in str(privacy).upper() and int(members or 0) >= 500:
+                    found.append(url)
+                    logger.info(f"    ✅ {group.get('name')} ({members} members)")
+                else:
+                    logger.info(f"    ⛔ {group.get('name')} — private or too small")
+        found = list(dict.fromkeys(found))
+        logger.info(f"FB discovery: {len(found)} public groups found")
+    except Exception as e:
+        logger.error(f"FB group discovery error: {e}")
+    return found
+
 def scrape_facebook_groups(since_date: str) -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
-    items = []
+    items  = []
+    groups = discover_facebook_groups()
+    if not groups:
+        logger.warning("No public Facebook groups discovered — skipping")
+        return []
     try:
         run = client.actor("apify/facebook-groups-scraper").call(run_input={
-            "startUrls": [{"url": u} for u in FACEBOOK_GROUPS],
+            "startUrls": [{"url": u} for u in groups],
             "maxPosts": 40,
             "maxComments": 0,
-            "onlyPostsNewerThan": since_date,   # ← Apify stops paginating once it hits older posts
+            "onlyPostsNewerThan": since_date,
         })
         for post in client.dataset(run["defaultDatasetId"]).iterate_items():
             text = post.get("text") or post.get("message", "")
@@ -458,17 +491,48 @@ def scrape_facebook_groups(since_date: str) -> list[dict]:
         logger.error(f"Facebook scraper error: {e}")
     return items
 
-# ── 2. REDDIT  ★★★★★ ──────────────────────────────────────
-def scrape_reddit() -> list[dict]:
+# ── REDDIT ────────────────────────────────────────────────
+def discover_subreddits() -> list[str]:
+    found, seen = [], set()
+    headers = {"User-Agent": "VersalLeadBot/1.0"}
+    for term in REDDIT_SEED_TERMS:
+        try:
+            r = httpx.get(
+                f"https://www.reddit.com/subreddits/search.json?q={term}&limit=10&sort=relevance",
+                headers=headers, timeout=15,
+            )
+            if r.status_code != 200:
+                continue
+            for child in r.json().get("data", {}).get("children", []):
+                d    = child.get("data", {})
+                name = d.get("display_name", "")
+                subs = d.get("subscribers", 0)
+                kind = d.get("subreddit_type", "")
+                if name and name not in seen and kind == "public" and subs >= 1000:
+                    found.append(name)
+                    seen.add(name)
+                    logger.info(f"  ✅ r/{name} ({subs:,} subscribers)")
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"Subreddit discovery error for '{term}': {e}")
+    logger.info(f"Reddit discovery: {len(found)} subreddits found")
+    return found
+
+def scrape_reddit(since_date: str) -> list[dict]:
     from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())  # fixed: was APIFY_TOKEN
-    items = []
+    client     = ApifyClient(get_apify_token())
+    items      = []
+    subreddits = discover_subreddits()
+    if not subreddits:
+        logger.warning("No subreddits discovered — skipping Reddit scrape")
+        return []
     try:
-        for sub in REDDIT_SUBREDDITS:
+        for sub in subreddits:
             logger.info(f"  Reddit: r/{sub}")
             run = client.actor("trudax/reddit-scraper-lite").call(run_input={
                 "startUrls": [{"url": f"https://www.reddit.com/r/{sub}/new/"}],
                 "maxPostCount": 30, "maxCommentCount": 0,
+                "afterDate": since_date,
             })
             for post in client.dataset(run["defaultDatasetId"]).iterate_items():
                 combined = f"{post.get('title','')} {post.get('body','')}".lower()
@@ -484,13 +548,11 @@ def scrape_reddit() -> list[dict]:
         logger.error(f"Reddit scraper error: {e}")
     return items
 
-# ── 3. TIKTOK  ★★★★ ──────────────────────────────────────
-# Finds restaurant owner accounts with low views = live proof they need Versal
-# Caption "trying to grow this 😭" + 47 views = perfect lead
+# ── TIKTOK ────────────────────────────────────────────────
 def scrape_tiktok() -> list[dict]:
     from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())  # fixed: was APIFY_TOKEN
-    items = []
+    client = ApifyClient(get_apify_token())
+    items  = []
     try:
         for hashtag in TIKTOK_HASHTAGS:
             logger.info(f"  TikTok: #{hashtag}")
@@ -506,27 +568,19 @@ def scrape_tiktok() -> list[dict]:
                 url     = video.get("webVideoUrl") or video.get("url", "")
                 author  = video.get("authorMeta", {})
                 bio     = author.get("signature", "") or author.get("bio", "")
-
-                # Only surface videos under the view threshold
                 if views > TIKTOK_MAX_VIEWS:
                     continue
-
-                # Combine caption + bio for context
-                full_text = f"TikTok video caption: {caption}\nAccount bio: {bio}\nViews: {views}"
-
-                # Quick keyword pre-filter before burning Gemini credits
-                combined_lower = (caption + bio).lower()
+                combined = (caption + bio).lower()
                 restaurant_signals = [
                     "restaurant", "café", "cafe", "pizza", "burger", "diner",
                     "food", "kitchen", "chef", "cook", "menu", "hospitality",
                 ]
-                if not any(sig in combined_lower for sig in restaurant_signals):
+                if not any(sig in combined for sig in restaurant_signals):
                     continue
-
                 items.append({
                     "platform": "tiktok",
                     "url": url or f"https://tiktok.com/@{author.get('name','')}",
-                    "text": full_text,
+                    "text": f"TikTok video caption: {caption}\nAccount bio: {bio}\nViews: {views}",
                     "tiktok_views": views,
                 })
             time.sleep(3)
@@ -535,65 +589,10 @@ def scrape_tiktok() -> list[dict]:
         logger.error(f"TikTok scraper error: {e}")
     return items
 
-# ── 4. GOOGLE REVIEWS  ★★★★ ──────────────────────────────
-def scrape_google_reviews() -> list[dict]:
-    from apify_client import ApifyClient
-    client = ApifyClient(APIFY_TOKEN)
-    items = []
-    try:
-        run = client.actor("compass/google-maps-scraper").call(run_input={
-            "searchStringsArray": GOOGLE_MAPS_QUERIES[:6],
-            "maxReviews": 5,
-            "reviewsSort": "newest",
-            "language": "en",
-        })
-        for place in client.dataset(run["defaultDatasetId"]).iterate_items():
-            rating = place.get("totalScore") or place.get("rating", 5)
-            if rating and float(rating) <= 3.5:
-                name        = place.get("title", "")
-                url         = place.get("url") or place.get("website", "")
-                reviews     = place.get("reviews", [{}])
-                review_text = reviews[0].get("text", "") if reviews else ""
-                text = f"Google Maps: {name} ({rating}★). Recent review: {review_text}"
-                if url:
-                    items.append({"platform": "google", "url": url, "text": text})
-        logger.info(f"Google Reviews: {len(items)} struggling restaurants")
-    except Exception as e:
-        logger.error(f"Google Reviews scraper error: {e}")
-    return items
-
-# ── 5. TRUSTPILOT  ★★★  (run 1x/week to save credits) ────
-def scrape_trustpilot() -> list[dict]:
-    from apify_client import ApifyClient
-    client = ApifyClient(APIFY_TOKEN)
-    items = []
-    try:
-        run = client.actor("apify/trustpilot-scraper").call(run_input={
-            "startUrls": [{"url": u} for u in TRUSTPILOT_CATEGORIES],
-            "maxReviews": 30,
-            "ratingFilter": [1, 2],
-        })
-        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
-            text = item.get("text") or item.get("reviewBody", "")
-            url  = item.get("businessUrl") or item.get("url", "")
-            if text:
-                items.append({
-                    "platform": "trustpilot",
-                    "url": url,
-                    "text": f"[TrustPilot low-star review] {text}",
-                })
-        logger.info(f"TrustPilot: {len(items)} reviews")
-    except Exception as e:
-        logger.error(f"TrustPilot scraper error: {e}")
-    return items
-
-# ── INSTAGRAM  ★★★★ ──────────────────────────────────────
-# Scrapes low-view Reels (≤100 views, ≤3 days old) from restaurant hashtags
-# Same signal as TikTok — owner posted, nobody saw it, they need Versal
+# ── INSTAGRAM ─────────────────────────────────────────────
 def scrape_instagram() -> list[dict]:
     from apify_client import ApifyClient
-    from datetime import timedelta
-    client = ApifyClient(get_apify_token())  # fixed: was APIFY_TOKEN
+    client = ApifyClient(get_apify_token())
     items  = []
     cutoff = datetime.now(timezone.utc) - timedelta(days=INSTAGRAM_MAX_AGE_DAYS)
     try:
@@ -610,32 +609,18 @@ def scrape_instagram() -> list[dict]:
                 url     = post.get("url") or post.get("shortCode", "")
                 if url and not url.startswith("http"):
                     url = f"https://www.instagram.com/p/{url}/"
-                owner   = post.get("ownerUsername") or post.get("owner", {}).get("username", "")
-                bio     = post.get("ownerBio") or ""
-
-                # Only Reels/videos under the view threshold
+                owner = post.get("ownerUsername") or post.get("owner", {}).get("username", "")
+                bio   = post.get("ownerBio") or ""
                 is_video = post.get("type") in ("Video", "Reel") or post.get("isVideo", False)
                 if not is_video or views > INSTAGRAM_MAX_VIEWS:
                     continue
-
-                # Quick restaurant pre-filter before burning Gemini credits
-                combined_lower = (caption + bio).lower()
-                restaurant_signals = [
-                    "restaurant", "café", "cafe", "pizza", "burger", "diner",
-                    "food", "kitchen", "chef", "cook", "menu", "hospitality",
-                ]
-                if not any(sig in combined_lower for sig in restaurant_signals):
+                combined = (caption + bio).lower()
+                if not any(s in combined for s in ["restaurant","café","cafe","pizza","burger","food","kitchen","chef"]):
                     continue
-
-                full_text = (
-                    f"Instagram Reel caption: {caption}\n"
-                    f"Account: @{owner} | Bio: {bio}\n"
-                    f"Views: {views} (posted within last {INSTAGRAM_MAX_AGE_DAYS} days)"
-                )
                 items.append({
                     "platform": "instagram",
                     "url": url,
-                    "text": full_text,
+                    "text": f"Instagram Reel caption: {caption}\nAccount: @{owner} | Bio: {bio}\nViews: {views}",
                     "ig_views": views,
                 })
             time.sleep(3)
@@ -644,13 +629,62 @@ def scrape_instagram() -> list[dict]:
         logger.error(f"Instagram scraper error: {e}")
     return items
 
-# ── YELP (optional) ───────────────────────────────────────
+# ── GOOGLE REVIEWS ────────────────────────────────────────
+def scrape_google_reviews() -> list[dict]:
+    from apify_client import ApifyClient
+    client = ApifyClient(get_apify_token())
+    items  = []
+    try:
+        run = client.actor("compass/google-maps-scraper").call(run_input={
+            "searchStringsArray": GOOGLE_MAPS_QUERIES[:6],
+            "maxReviews": 5,
+            "reviewsSort": "newest",
+            "language": "en",
+        })
+        for place in client.dataset(run["defaultDatasetId"]).iterate_items():
+            rating = place.get("totalScore") or place.get("rating", 5)
+            if rating and float(rating) <= 3.5:
+                name    = place.get("title", "")
+                url     = place.get("url") or place.get("website", "")
+                reviews = place.get("reviews", [{}])
+                review_text = reviews[0].get("text", "") if reviews else ""
+                text = f"Google Maps: {name} ({rating}★). Recent review: {review_text}"
+                if url:
+                    items.append({"platform": "google", "url": url, "text": text})
+        logger.info(f"Google Reviews: {len(items)} struggling restaurants")
+    except Exception as e:
+        logger.error(f"Google Reviews scraper error: {e}")
+    return items
+
+# ── TRUSTPILOT ────────────────────────────────────────────
+def scrape_trustpilot() -> list[dict]:
+    from apify_client import ApifyClient
+    client = ApifyClient(get_apify_token())
+    items  = []
+    try:
+        run = client.actor("apify/trustpilot-scraper").call(run_input={
+            "startUrls": [{"url": u} for u in TRUSTPILOT_CATEGORIES],
+            "maxReviews": 30,
+            "ratingFilter": [1, 2],
+        })
+        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+            text = item.get("text") or item.get("reviewBody", "")
+            url  = item.get("businessUrl") or item.get("url", "")
+            if text:
+                items.append({"platform": "trustpilot", "url": url,
+                              "text": f"[TrustPilot low-star review] {text}"})
+        logger.info(f"TrustPilot: {len(items)} reviews")
+    except Exception as e:
+        logger.error(f"TrustPilot scraper error: {e}")
+    return items
+
+# ── YELP ──────────────────────────────────────────────────
 def scrape_yelp() -> list[dict]:
     if not YELP_RESTAURANTS:
         return []
     from apify_client import ApifyClient
-    client = ApifyClient(APIFY_TOKEN)
-    items = []
+    client = ApifyClient(get_apify_token())
+    items  = []
     try:
         run = client.actor("apify/yelp-scraper").call(run_input={
             "startUrls": [{"url": u} for u in YELP_RESTAURANTS], "maxReviews": 10,
@@ -666,87 +700,16 @@ def scrape_yelp() -> list[dict]:
         logger.error(f"Yelp scraper error: {e}")
     return items
 
-
 # ═══════════════════════════════════════════════════════════
 # MASTER PIPELINE
 # ═══════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════
-# DEDUP — skip URLs already scraped / stored in Supabase
-# ═══════════════════════════════════════════════════════════
-_seen_urls: set[str] = set()   # in-memory cache for current run
-
-async def get_last_run_date() -> str:
-    """Returns ISO date string of the most recent lead in Supabase.
-    First ever run → goes back 30 days for a big initial batch.
-    All subsequent runs → only scrapes since the last lead was stored."""
-    try:
-        async with httpx.AsyncClient() as client:
-            headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-            r = await client.get(
-                f"{SUPABASE_URL}/rest/v1/leads",
-                headers=headers,
-                params={"select": "processed_at", "order": "processed_at.desc", "limit": 1},
-                timeout=10,
-            )
-            rows = r.json()
-            if rows and rows[0].get("processed_at"):
-                last_date = rows[0]["processed_at"][:10]
-                logger.info(f"📅 Supabase has existing leads — scraping since last run: {last_date}")
-                return last_date
-            # Empty table = first ever run
-            from datetime import timedelta
-            first_run_date = (datetime.now(timezone.utc) - timedelta(days=50)).strftime("%Y-%m-%d")
-            logger.info(f"🆕 First ever run — scraping last 50 days since: {first_run_date}")
-            return first_run_date
-    from datetime import timedelta
-    # No leads in Supabase yet = first ever run → go back 30 days for a big initial batch
-    # Subsequent runs use the last lead date so only new posts are scraped
-    is_first_run = True  # will only reach here if Supabase is empty or errored
-    days_back = 50 if is_first_run else 3
-    return (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
-
-async def load_seen_urls() -> set[str]:
-    """Pull all source_urls from Supabase so we never re-process them."""
-    try:
-        async with httpx.AsyncClient() as client:
-            headers = {
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            }
-            # Fetch in pages of 1000 (Supabase default limit)
-            seen, offset = set(), 0
-            while True:
-                r = await client.get(
-                    f"{SUPABASE_URL}/rest/v1/leads",
-                    headers=headers,
-                    params={"select": "source_url", "limit": 1000, "offset": offset},
-                    timeout=15,
-                )
-                rows = r.json()
-                if not rows:
-                    break
-                seen.update(row["source_url"] for row in rows if row.get("source_url"))
-                if len(rows) < 1000:
-                    break
-                offset += 1000
-            logger.info(f"Dedup: loaded {len(seen)} previously seen URLs from Supabase")
-            return seen
-    except Exception as e:
-        logger.error(f"Dedup load error (continuing without dedup): {e}")
-        return set()
-
-def is_new(url: str, seen: set[str]) -> bool:
-    if not url or url in seen:
-        return False
-    seen.add(url)   # mark immediately so dupes within same run are caught too
-    return True
-
 _pipeline_lock = asyncio.Lock()
 
 async def run_pipeline(test_mode: bool = False):
     if _pipeline_lock.locked():
         logger.warning("⚠️  Pipeline already running — skipping duplicate /run call")
         return {"skipped": True, "reason": "pipeline already in progress"}
+
     async with _pipeline_lock:
         start = time.monotonic()
         logger.info("=" * 60)
@@ -754,114 +717,75 @@ async def run_pipeline(test_mode: bool = False):
         logger.info("   Platforms: Facebook · Reddit · TikTok · Google · TrustPilot")
         logger.info("   Markets:   🇺🇸 USA  🇬🇧 UK  🇨🇦 Canada")
         logger.info("=" * 60)
-    logger.info("=" * 60)
-    logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v3")
-    logger.info("   Platforms: Facebook · Reddit · TikTok · Google · TrustPilot")
-    logger.info("   Markets:   🇺🇸 USA  🇬🇧 UK  🇨🇦 Canada")
-    logger.info("=" * 60)
 
-    if test_mode:
-        logger.info("TEST MODE — sample data, no Apify credits used")
-        raw_items = [
-            {
-                "platform": "facebook",
-                "url": "https://facebook.com/groups/restaurantownersuk/test1",
-                "text": "I run a burger spot in Manchester. Been posting on Instagram for 2 years and still only getting 80-100 views per video. Spent hours on this and zero new customers. Revenue down 25% vs last year. Does anyone know how to actually make social media work for a restaurant?",
-            },
-            {
-                "platform": "reddit",
-                "url": "https://reddit.com/r/restaurantowners/test2",
-                "text": "Running a burger joint in Austin TX. DoorDash is killing our margins and we barely have an Instagram presence. Somebody told me TikTok is the move but I don't know where to start. Any restaurant owners here using it successfully?",
-            },
-            {
-                "platform": "tiktok",
-                "url": "https://tiktok.com/@leedscafemum/video/123",
-                "text": "TikTok video caption: Made 50 croissants today, trying to grow this account 😭 nobody sees my videos\nAccount bio: Owner of The Corner Café, Leeds 🥐 Open 7am-4pm\nViews: 47",
-                "tiktok_views": 47,
-            },
-            {
-                "platform": "tiktok",
-                "url": "https://tiktok.com/@pizzajoenyc/video/456",
-                "text": "TikTok video caption: Behind the scenes pizza prep — why won't this go viral lol. Been posting for 6 months and stuck at like 100 views\nAccount bio: Joe's Pizza Brooklyn NY 🍕 Family owned since 1987\nViews: 112",
-                "tiktok_views": 112,
-            },
-            {
-                "platform": "google",
-                "url": "https://maps.google.com/?cid=test1",
-                "text": "Google Maps: Mario's Pizza NYC (2.8★). Recent review: Great pizza but impossible to find online, no social media presence at all, discovered them totally by accident.",
-            },
-            {
-                "platform": "trustpilot",
-                "url": "https://uk.trustpilot.com/review/examplecafe",
-                "text": "[TrustPilot low-star review] Food was fine but they clearly have no online presence. Their Instagram hasn't been updated in months. Shame because the food is actually great.",
-            },
-            {
-                "platform": "reddit",
-                "url": "https://reddit.com/r/canadabusiness/test3",
-                "text": "Cafe owner in Toronto. Foot traffic is way down and Skip The Dishes takes 30% of every order. Tried posting Reels but the algorithm buries us. Need help getting visible locally.",
-            },
-        ]
-    else:
-        since_date = await get_last_run_date()
-        logger.info(f"📅 Only scraping posts newer than: {since_date}")
-        raw_items = []
-        if ACTIVE_PLATFORMS.get("facebook"):   raw_items += scrape_facebook_groups(since_date)
-        if ACTIVE_PLATFORMS.get("reddit"):     raw_items += scrape_reddit(since_date)
-        if ACTIVE_PLATFORMS.get("tiktok"):     raw_items += scrape_tiktok()
-        if ACTIVE_PLATFORMS.get("instagram"):  raw_items += scrape_instagram()
-        if ACTIVE_PLATFORMS.get("google"):     raw_items += scrape_google_reviews()
-        if ACTIVE_PLATFORMS.get("trustpilot"): raw_items += scrape_trustpilot()
-        if ACTIVE_PLATFORMS.get("yelp"):       raw_items += scrape_yelp()
+        if test_mode:
+            logger.info("TEST MODE — sample data, no Apify credits used")
+            raw_items = [
+                {"platform": "facebook", "url": "https://facebook.com/groups/restaurantownersuk/test1",
+                 "text": "I run a burger spot in Manchester. Been posting on Instagram for 2 years and still only getting 80-100 views per video. Revenue down 25% vs last year."},
+                {"platform": "reddit", "url": "https://reddit.com/r/restaurantowners/test2",
+                 "text": "Running a burger joint in Austin TX. DoorDash is killing our margins and we barely have an Instagram presence."},
+                {"platform": "tiktok", "url": "https://tiktok.com/@leedscafemum/video/123",
+                 "text": "TikTok video caption: Made 50 croissants today, trying to grow this account 😭\nAccount bio: Owner of The Corner Café, Leeds\nViews: 47",
+                 "tiktok_views": 47},
+                {"platform": "google", "url": "https://maps.google.com/?cid=test1",
+                 "text": "Google Maps: Mario's Pizza NYC (2.8★). Recent review: no social media presence at all."},
+            ]
+        else:
+            since_date = await get_last_run_date()
+            logger.info(f"📅 Only scraping posts newer than: {since_date}")
+            raw_items = []
+            if ACTIVE_PLATFORMS.get("facebook"):   raw_items += scrape_facebook_groups(since_date)
+            if ACTIVE_PLATFORMS.get("reddit"):     raw_items += scrape_reddit(since_date)
+            if ACTIVE_PLATFORMS.get("tiktok"):     raw_items += scrape_tiktok()
+            if ACTIVE_PLATFORMS.get("instagram"):  raw_items += scrape_instagram()
+            if ACTIVE_PLATFORMS.get("google"):     raw_items += scrape_google_reviews()
+            if ACTIVE_PLATFORMS.get("trustpilot"): raw_items += scrape_trustpilot()
+            if ACTIVE_PLATFORMS.get("yelp"):       raw_items += scrape_yelp()
 
-    # ── Dedup: skip anything Supabase already has ──────────
-    if not test_mode:
-        seen = await load_seen_urls()
-        before = len(raw_items)
-        raw_items = [item for item in raw_items if is_new(item.get("url", ""), seen)]
-        logger.info(f"Dedup: {before - len(raw_items)} already-seen items skipped, {len(raw_items)} new to process")
-    # ──────────────────────────────────────────────────────
+            # Dedup — skip URLs already in Supabase
+            seen   = await load_seen_urls()
+            before = len(raw_items)
+            raw_items = [item for item in raw_items if is_new(item.get("url", ""), seen)]
+            logger.info(f"Dedup: {before - len(raw_items)} already-seen skipped, {len(raw_items)} new")
 
-    logger.info(f"Total raw items to process: {len(raw_items)}")
+        logger.info(f"Total raw items to process: {len(raw_items)}")
 
-    qualified: list[LeadOutput] = []
-    for item in raw_items:
-        logger.info(f"\nAnalysing [{item['platform'].upper()}]: {item['text'][:80]}...")
-        lead = process_single_lead(
-            item["text"], item["platform"], item["url"],
-            tiktok_views=item.get("tiktok_views"),
-        )
-        if lead:
-            qualified.append(lead)
-            logger.info(f"  ✅ QUALIFIED — Score:{lead.intent_score} | {lead.market} | {lead.problem_category}")
-        time.sleep(0.5)
+        qualified: list[LeadOutput] = []
+        for item in raw_items:
+            logger.info(f"\nAnalysing [{item['platform'].upper()}]: {item['text'][:80]}...")
+            lead = process_single_lead(
+                item["text"], item["platform"], item["url"],
+                tiktok_views=item.get("tiktok_views"),
+            )
+            if lead:
+                qualified.append(lead)
+                logger.info(f"  ✅ QUALIFIED — Score:{lead.intent_score} | {lead.market} | {lead.problem_category}")
+            time.sleep(0.5)
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Qualified leads: {len(qualified)} / {len(raw_items)}")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Qualified leads: {len(qualified)} / {len(raw_items)}")
 
-    by_market   = {}
-    by_platform = {}
-    for lead in qualified:
-        by_market.setdefault(lead.market, 0)
-        by_market[lead.market] += 1
-        by_platform.setdefault(lead.source_platform, 0)
-        by_platform[lead.source_platform] += 1
+        by_market, by_platform = {}, {}
+        for lead in qualified:
+            by_market.setdefault(lead.market, 0)
+            by_market[lead.market] += 1
+            by_platform.setdefault(lead.source_platform, 0)
+            by_platform[lead.source_platform] += 1
 
-    logger.info(f"By market:   {by_market}")
-    logger.info(f"By platform: {by_platform}")
+        for lead in qualified:
+            logger.info(f"\nDelivering {lead.market} score-{lead.intent_score} [{lead.source_platform}]...")
+            await deliver_lead(lead)
 
-    for lead in qualified:
-        logger.info(f"\nDelivering {lead.market} score-{lead.intent_score} lead [{lead.source_platform}]...")
-        await deliver_lead(lead)
-
-    elapsed = round(time.monotonic() - start, 1)
-    logger.info(f"\n✅ DONE — {len(qualified)} Versal leads delivered in {elapsed}s")
-    return {
-        "leads_delivered": len(qualified),
-        "total_processed": len(raw_items),
-        "by_market": by_market,
-        "by_platform": by_platform,
-        "seconds": elapsed,
-    }
+        elapsed = round(time.monotonic() - start, 1)
+        logger.info(f"\n✅ DONE — {len(qualified)} Versal leads delivered in {elapsed}s")
+        return {
+            "leads_delivered": len(qualified),
+            "total_processed": len(raw_items),
+            "by_market": by_market,
+            "by_platform": by_platform,
+            "seconds": elapsed,
+        }
 
 
 if __name__ == "__main__":
