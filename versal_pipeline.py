@@ -81,13 +81,10 @@ Tone: Peer-to-peer, genuinely helpful, NEVER salesy. Lead with a tip. End with t
 # TARGET LISTS
 # ═══════════════════════════════════════════════════════════
 
-# Reddit — high signal, anonymous = raw honest pain
-REDDIT_SUBREDDITS = [
-    "restaurantowners", "restaurateur", "Restaurant_Managers",
-    "FoodService", "KitchenConfidential", "Serverlife", "bartenders",
-    "smallbusiness", "Entrepreneur",
-    "UKbusiness", "AskUK",
-    "canadabusiness", "ontario", "vancouver",
+# Reddit — seed terms used to discover subreddits dynamically
+REDDIT_SEED_TERMS = [
+    "restaurant owner", "cafe owner", "food business",
+    "hospitality UK", "restaurant business Canada",
 ]
 
 KEYWORDS = [
@@ -100,17 +97,15 @@ KEYWORDS = [
     "doordash", "just eat", "skip the dishes",
 ]
 
-# Facebook Groups — highest owner density, direct pain points
-FACEBOOK_GROUPS = [
-    "https://www.facebook.com/groups/restaurantownersuk/",
-    "https://www.facebook.com/groups/ukrestaurantowners/",
-    "https://www.facebook.com/groups/hospitalityuk/",
-    "https://www.facebook.com/groups/cafeownersuk/",
-    "https://www.facebook.com/groups/restaurantownersusa/",
-    "https://www.facebook.com/groups/restaurantbusinessowners/",
-    "https://www.facebook.com/groups/foodserviceprofessionals/",
-    "https://www.facebook.com/groups/canadianrestaurantowners/",
-    "https://www.facebook.com/groups/torontofoodbusiness/",
+# Facebook — seed search terms used to discover public groups dynamically
+FACEBOOK_SEED_TERMS = [
+    "restaurant owners UK",
+    "cafe owners UK",
+    "restaurant business owners USA",
+    "food business owners Canada",
+    "hospitality business owners",
+    "pizza restaurant owners",
+    "burger restaurant owners",
 ]
 
 # Instagram — low-view Reels from restaurant accounts (≤100 views, 2-3 days old)
@@ -442,7 +437,7 @@ async def deliver_lead(lead: LeadOutput):
 # ═══════════════════════════════════════════════════════════
 
 # ── 1. FACEBOOK GROUPS  ★★★★★ ─────────────────────────────
-def scrape_facebook_groups() -> list[dict]:
+def scrape_facebook_groups(since_date: str) -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items = []
@@ -451,6 +446,7 @@ def scrape_facebook_groups() -> list[dict]:
             "startUrls": [{"url": u} for u in FACEBOOK_GROUPS],
             "maxPosts": 40,
             "maxComments": 0,
+            "onlyPostsNewerThan": since_date,   # ← Apify stops paginating once it hits older posts
         })
         for post in client.dataset(run["defaultDatasetId"]).iterate_items():
             text = post.get("text") or post.get("message", "")
@@ -674,6 +670,77 @@ def scrape_yelp() -> list[dict]:
 # ═══════════════════════════════════════════════════════════
 # MASTER PIPELINE
 # ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+# DEDUP — skip URLs already scraped / stored in Supabase
+# ═══════════════════════════════════════════════════════════
+_seen_urls: set[str] = set()   # in-memory cache for current run
+
+async def get_last_run_date() -> str:
+    """Returns ISO date string of the most recent lead in Supabase.
+    First ever run → goes back 30 days for a big initial batch.
+    All subsequent runs → only scrapes since the last lead was stored."""
+    try:
+        async with httpx.AsyncClient() as client:
+            headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/leads",
+                headers=headers,
+                params={"select": "processed_at", "order": "processed_at.desc", "limit": 1},
+                timeout=10,
+            )
+            rows = r.json()
+            if rows and rows[0].get("processed_at"):
+                last_date = rows[0]["processed_at"][:10]
+                logger.info(f"📅 Supabase has existing leads — scraping since last run: {last_date}")
+                return last_date
+            # Empty table = first ever run
+            from datetime import timedelta
+            first_run_date = (datetime.now(timezone.utc) - timedelta(days=50)).strftime("%Y-%m-%d")
+            logger.info(f"🆕 First ever run — scraping last 50 days since: {first_run_date}")
+            return first_run_date
+    from datetime import timedelta
+    # No leads in Supabase yet = first ever run → go back 30 days for a big initial batch
+    # Subsequent runs use the last lead date so only new posts are scraped
+    is_first_run = True  # will only reach here if Supabase is empty or errored
+    days_back = 50 if is_first_run else 3
+    return (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+
+async def load_seen_urls() -> set[str]:
+    """Pull all source_urls from Supabase so we never re-process them."""
+    try:
+        async with httpx.AsyncClient() as client:
+            headers = {
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            }
+            # Fetch in pages of 1000 (Supabase default limit)
+            seen, offset = set(), 0
+            while True:
+                r = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/leads",
+                    headers=headers,
+                    params={"select": "source_url", "limit": 1000, "offset": offset},
+                    timeout=15,
+                )
+                rows = r.json()
+                if not rows:
+                    break
+                seen.update(row["source_url"] for row in rows if row.get("source_url"))
+                if len(rows) < 1000:
+                    break
+                offset += 1000
+            logger.info(f"Dedup: loaded {len(seen)} previously seen URLs from Supabase")
+            return seen
+    except Exception as e:
+        logger.error(f"Dedup load error (continuing without dedup): {e}")
+        return set()
+
+def is_new(url: str, seen: set[str]) -> bool:
+    if not url or url in seen:
+        return False
+    seen.add(url)   # mark immediately so dupes within same run are caught too
+    return True
+
 _pipeline_lock = asyncio.Lock()
 
 async def run_pipeline(test_mode: bool = False):
@@ -733,14 +800,24 @@ async def _run_pipeline_inner(test_mode: bool = False):
             },
         ]
     else:
+        since_date = await get_last_run_date()
+        logger.info(f"📅 Only scraping posts newer than: {since_date}")
         raw_items = []
-        if ACTIVE_PLATFORMS.get("facebook"):   raw_items += scrape_facebook_groups()
-        if ACTIVE_PLATFORMS.get("reddit"):     raw_items += scrape_reddit()
+        if ACTIVE_PLATFORMS.get("facebook"):   raw_items += scrape_facebook_groups(since_date)
+        if ACTIVE_PLATFORMS.get("reddit"):     raw_items += scrape_reddit(since_date)
         if ACTIVE_PLATFORMS.get("tiktok"):     raw_items += scrape_tiktok()
         if ACTIVE_PLATFORMS.get("instagram"):  raw_items += scrape_instagram()
         if ACTIVE_PLATFORMS.get("google"):     raw_items += scrape_google_reviews()
         if ACTIVE_PLATFORMS.get("trustpilot"): raw_items += scrape_trustpilot()
         if ACTIVE_PLATFORMS.get("yelp"):       raw_items += scrape_yelp()
+
+    # ── Dedup: skip anything Supabase already has ──────────
+    if not test_mode:
+        seen = await load_seen_urls()
+        before = len(raw_items)
+        raw_items = [item for item in raw_items if is_new(item.get("url", ""), seen)]
+        logger.info(f"Dedup: {before - len(raw_items)} already-seen items skipped, {len(raw_items)} new to process")
+    # ──────────────────────────────────────────────────────
 
     logger.info(f"Total raw items to process: {len(raw_items)}")
 
