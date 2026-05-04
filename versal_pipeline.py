@@ -748,10 +748,12 @@ async def run_pipeline(test_mode: bool = False):
         logger.warning("⚠️  Pipeline already running — skipping duplicate /run call")
         return {"skipped": True, "reason": "pipeline already in progress"}
     async with _pipeline_lock:
-        return await _run_pipeline_inner(test_mode)
-
-async def _run_pipeline_inner(test_mode: bool = False):
-    start = time.monotonic()
+        start = time.monotonic()
+        logger.info("=" * 60)
+        logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v3")
+        logger.info("   Platforms: Facebook · Reddit · TikTok · Google · TrustPilot")
+        logger.info("   Markets:   🇺🇸 USA  🇬🇧 UK  🇨🇦 Canada")
+        logger.info("=" * 60)
     logger.info("=" * 60)
     logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v3")
     logger.info("   Platforms: Facebook · Reddit · TikTok · Google · TrustPilot")
@@ -863,7 +865,5 @@ async def _run_pipeline_inner(test_mode: bool = False):
 
 
 if __name__ == "__main__":
-    # test_mode=True  → instant run with sample data, no Apify credits spent
-    # test_mode=False → full live run across all 5 platforms, all 3 markets
     result = asyncio.run(run_pipeline(test_mode=True))
     print("\n", json.dumps(result, indent=2))
