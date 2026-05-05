@@ -1,18 +1,18 @@
 """
-Versal Digital Solutions — Lean Lead Machine v5
+Versal Digital Solutions — Lean Lead Machine v6
 Platforms: Reddit, Facebook Groups, TikTok, Google Reviews, TrustPilot
 Markets:   USA · UK · Canada
 Leads → Slack (copy-paste ready) + Supabase + Make.com
 
-v5 fixes vs v4:
-- Gemini gap raised 4.5s → 6s (10/min, well under 15/min free tier)
-- Batch pacing: process 5 leads → hard 75s pause (full minute reset buffer)
-- Retry backoff: 62s → 90s → 120s → 180s (exponential, not flat)
-- After each retry wait, _last_gemini_call is reset so gap enforcement
-  doesn't add ANOTHER wait on top of the backoff
-- Skip-and-log on final retry failure instead of silently returning {}
-- Apify monthly limit → caught and raises a clear RuntimeError
-- Google actor name fixed: apify/google-maps-scraper (was compass/)
+v6 changes vs v5:
+- Gemini upgraded to Tier 1 Prepay — ALL rate limiting removed
+  (no GEMINI_MIN_GAP, no BATCH_SIZE/BATCH_PAUSE, no RETRY_WAITS)
+- ask_gemini() simplified to single try/except, no retry loops
+- run_pipeline() batch pause block removed
+- Daily quota abort flag removed (not needed on paid tier)
+- Reddit scraper propagates Apify monthly limit as RuntimeError
+  so TikTok/Google scrapers are skipped cleanly
+- Google actor name: apify/google-maps-scraper (confirmed correct)
 """
 
 import asyncio, json, httpx, os, time, logging
@@ -153,67 +153,26 @@ class LeadOutput(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# GEMINI  —  RATE-LIMIT-SAFE ENGINE
-#
-# Free tier: 15 requests/min, 1500 requests/day
-# Strategy:
-#   • GEMINI_MIN_GAP = 6s  →  max 10/min  (33% headroom)
-#   • BATCH_SIZE = 5, BATCH_PAUSE = 75s  →  full minute resets between batches
-#   • Exponential retry waits: 90 → 120 → 180 → 240s
-#   • After each wait, _last_gemini_call is set to NOW so the gap
-#     enforcer doesn't stack an extra 6s on top of the backoff
+# GEMINI  —  PAID TIER (Tier 1 Prepay)
+# No rate limiting needed — 1000 requests/min on paid tier
 # ═══════════════════════════════════════════════════════════
-GEMINI_MIN_GAP  = 6.0    # seconds between calls (10/min)
-BATCH_SIZE      = 5      # leads per batch
-BATCH_PAUSE     = 75     # seconds between batches
-RETRY_WAITS     = [90, 120, 180, 240]   # backoff schedule (seconds)
-
-_last_gemini_call = 0.0
-
-def _gemini_gap_wait():
-    """Enforce minimum gap between Gemini calls."""
-    global _last_gemini_call
-    elapsed = time.monotonic() - _last_gemini_call
-    if elapsed < GEMINI_MIN_GAP:
-        time.sleep(GEMINI_MIN_GAP - elapsed)
-    _last_gemini_call = time.monotonic()
 
 def ask_gemini(prompt: str) -> dict:
-    global _last_gemini_call
-    _gemini_gap_wait()
-
-    for attempt, wait in enumerate([0] + RETRY_WAITS, start=1):
-        if wait:
-            logger.warning(f"Gemini 429 — waiting {wait}s (attempt {attempt}/{len(RETRY_WAITS)+1})")
-            time.sleep(wait)
-            _last_gemini_call = time.monotonic()   # reset so gap enforcer doesn't double-wait
-
-        try:
-            response = gemini_client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=900),
-            )
-            text = response.text.strip()
-            if "```" in text:
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            _last_gemini_call = time.monotonic()
-            return json.loads(text.strip())
-
-        except Exception as e:
-            msg = str(e)
-            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                if attempt > len(RETRY_WAITS):
-                    logger.error(f"Gemini exhausted all retries — skipping this lead")
-                    return {}
-                # loop continues with next wait from RETRY_WAITS
-            else:
-                logger.error(f"Gemini non-rate-limit error: {e}")
-                return {}
-
-    return {}
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=900),
+        )
+        text = response.text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text.strip())
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+        return {}
 
 
 def analyse_lead(text: str, platform: str,
@@ -235,8 +194,6 @@ def analyse_lead(text: str, platform: str,
     tiktok_note = (f"\nThis TikTok video has only {tiktok_views} views — "
                    "reference this naturally." if tiktok_views else "")
     tone = platform_tones.get(platform, "friendly helpful message")
-    # Market note will be filled by Gemini once it detects the market;
-    # we pass all three so it picks the right one.
     market_block = "\n".join(f"- If market={k}: {v}" for k, v in market_notes.items())
 
     return ask_gemini(f"""You are an analyst and copywriter for Versal Digital Solutions.
@@ -456,7 +413,13 @@ async def deliver_lead(lead: LeadOutput):
 # SCRAPERS
 # ═══════════════════════════════════════════════════════════
 
+# Flag to stop all Apify scrapers if monthly limit is hit
+_apify_limit_hit = False
+
 def scrape_facebook_groups(since_date: str) -> list[dict]:
+    global _apify_limit_hit
+    if _apify_limit_hit:
+        return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
@@ -472,7 +435,12 @@ def scrape_facebook_groups(since_date: str) -> list[dict]:
                 items.append({"platform": "facebook", "url": url, "text": text})
         logger.info(f"Facebook: {len(items)} matching posts")
     except Exception as e:
-        logger.error(f"Facebook error: {e}")
+        msg = str(e)
+        if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
+            logger.error("Apify monthly limit hit — stopping all scraping")
+            _apify_limit_hit = True
+        else:
+            logger.error(f"Facebook error: {e}")
     return items
 
 def discover_subreddits() -> list[str]:
@@ -504,6 +472,9 @@ def discover_subreddits() -> list[str]:
     return found
 
 def scrape_reddit(since_date: str) -> list[dict]:
+    global _apify_limit_hit
+    if _apify_limit_hit:
+        return []
     from apify_client import ApifyClient
     client     = ApifyClient(get_apify_token())
     items      = []
@@ -513,11 +484,21 @@ def scrape_reddit(since_date: str) -> list[dict]:
         return []
     try:
         for sub in subreddits:
+            if _apify_limit_hit:
+                break
             logger.info(f"  Reddit: r/{sub}")
-            run = client.actor("trudax/reddit-scraper-lite").call(run_input={
-                "startUrls": [{"url": f"https://www.reddit.com/r/{sub}/new/"}],
-                "maxPostCount": 30, "maxCommentCount": 0, "afterDate": since_date,
-            })
+            try:
+                run = client.actor("trudax/reddit-scraper-lite").call(run_input={
+                    "startUrls": [{"url": f"https://www.reddit.com/r/{sub}/new/"}],
+                    "maxPostCount": 30, "maxCommentCount": 0, "afterDate": since_date,
+                })
+            except Exception as e:
+                msg = str(e)
+                if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
+                    logger.error("Apify monthly limit hit — stopping all scraping")
+                    _apify_limit_hit = True
+                    break
+                raise
             for post in client.dataset(run["defaultDatasetId"]).iterate_items():
                 combined = f"{post.get('title','')} {post.get('body','')}".lower()
                 if any(kw in combined for kw in KEYWORDS):
@@ -533,11 +514,16 @@ def scrape_reddit(since_date: str) -> list[dict]:
     return items
 
 def scrape_tiktok() -> list[dict]:
+    global _apify_limit_hit
+    if _apify_limit_hit:
+        return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
     try:
         for hashtag in TIKTOK_HASHTAGS:
+            if _apify_limit_hit:
+                break
             logger.info(f"  TikTok: #{hashtag}")
             try:
                 run = client.actor("clockworks/free-tiktok-scraper").call(run_input={
@@ -548,6 +534,7 @@ def scrape_tiktok() -> list[dict]:
                 msg = str(e)
                 if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
                     logger.error("Apify monthly limit hit — stopping TikTok scraping")
+                    _apify_limit_hit = True
                     break
                 raise
             for video in client.dataset(run["defaultDatasetId"]).iterate_items():
@@ -574,6 +561,9 @@ def scrape_tiktok() -> list[dict]:
     return items
 
 def scrape_google_reviews() -> list[dict]:
+    global _apify_limit_hit
+    if _apify_limit_hit:
+        return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
@@ -596,10 +586,18 @@ def scrape_google_reviews() -> list[dict]:
                     })
         logger.info(f"Google: {len(items)} struggling restaurants")
     except Exception as e:
-        logger.error(f"Google error: {e}")
+        msg = str(e)
+        if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
+            logger.error("Apify monthly limit hit during Google scrape")
+            _apify_limit_hit = True
+        else:
+            logger.error(f"Google error: {e}")
     return items
 
 def scrape_trustpilot() -> list[dict]:
+    global _apify_limit_hit
+    if _apify_limit_hit:
+        return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
@@ -620,7 +618,8 @@ def scrape_trustpilot() -> list[dict]:
     return items
 
 def scrape_yelp() -> list[dict]:
-    if not YELP_RESTAURANTS:
+    global _apify_limit_hit
+    if _apify_limit_hit or not YELP_RESTAURANTS:
         return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
@@ -646,6 +645,9 @@ def scrape_yelp() -> list[dict]:
 _pipeline_lock = asyncio.Lock()
 
 async def run_pipeline(test_mode: bool = False):
+    global _apify_limit_hit
+    _apify_limit_hit = False  # reset per run
+
     if _pipeline_lock.locked():
         logger.warning("⚠️  Pipeline already running — skipping duplicate call")
         return {"skipped": True, "reason": "already running"}
@@ -653,10 +655,10 @@ async def run_pipeline(test_mode: bool = False):
     async with _pipeline_lock:
         start = time.monotonic()
         logger.info("=" * 60)
-        logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v5")
+        logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v6")
         logger.info("   Platforms: Facebook · Reddit · TikTok · Google · TrustPilot")
         logger.info("   Markets:   🇺🇸 USA  🇬🇧 UK  🇨🇦 Canada")
-        logger.info(f"   Gemini pacing: {GEMINI_MIN_GAP}s/call · batch {BATCH_SIZE} → pause {BATCH_PAUSE}s")
+        logger.info("   Gemini: Tier 1 Prepay — no rate limiting")
         logger.info("=" * 60)
 
         if test_mode:
@@ -682,26 +684,20 @@ async def run_pipeline(test_mode: bool = False):
             if ACTIVE_PLATFORMS.get("trustpilot"): raw_items += scrape_trustpilot()
             if ACTIVE_PLATFORMS.get("yelp"):       raw_items += scrape_yelp()
 
+            if _apify_limit_hit:
+                logger.warning("⚠️  Apify monthly limit hit — processing whatever was collected before cutoff")
+
             seen   = await load_seen_urls()
             before = len(raw_items)
             raw_items = [i for i in raw_items if is_new(i.get("url", ""), seen)]
             logger.info(f"Dedup: {before - len(raw_items)} skipped, {len(raw_items)} new")
 
         n = len(raw_items)
-        estimated = (n * GEMINI_MIN_GAP) + ((n // BATCH_SIZE) * BATCH_PAUSE)
-        logger.info(f"Processing {n} items — est. Gemini time ~{int(estimated)}s "
-                    f"({n} calls + {n // BATCH_SIZE} batch pause{'s' if n//BATCH_SIZE!=1 else ''})")
+        logger.info(f"Processing {n} items")
 
         qualified: list[LeadOutput] = []
 
         for i, item in enumerate(raw_items):
-            # ── Batch pause: after every BATCH_SIZE leads, wait for the
-            #    Gemini per-minute window to fully reset
-            if i > 0 and i % BATCH_SIZE == 0:
-                logger.info(f"  ⏸  Batch pause {BATCH_PAUSE}s to reset Gemini rate limit "
-                            f"(batch {i // BATCH_SIZE} of {(n-1) // BATCH_SIZE + 1})")
-                time.sleep(BATCH_PAUSE)
-
             logger.info(f"\n[{i+1}/{n}][{item['platform'].upper()}] {item['text'][:80]}...")
             lead = process_single_lead(
                 item["text"], item["platform"], item["url"],
@@ -732,6 +728,7 @@ async def run_pipeline(test_mode: bool = False):
             "by_market": by_market,
             "by_platform": by_platform,
             "seconds": elapsed,
+            "apify_limit_hit": _apify_limit_hit,
         }
 
 
