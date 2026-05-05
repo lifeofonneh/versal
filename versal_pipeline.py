@@ -163,14 +163,25 @@ def ask_gemini(prompt: str) -> dict:
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=900),
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=900,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),  # disable thinking tokens
+            ),
         )
         text = response.text.strip()
+        # Strip markdown code fences if present
         if "```" in text:
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        return json.loads(text.strip())
+            parts = text.split("```")
+            # parts[1] is the fenced block; strip optional "json" language tag
+            text = parts[1].lstrip("json").strip()
+        # Extract the first JSON object (guards against any stray leading text)
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        if start == -1 or end == 0:
+            logger.error(f"Gemini: no JSON object found in response: {text[:200]}")
+            return {}
+        return json.loads(text[start:end])
     except Exception as e:
         logger.error(f"Gemini error: {e}")
         return {}
@@ -421,22 +432,27 @@ def scrape_facebook_groups(since_date: str) -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
-    try:
-        run = client.actor("apify/facebook-groups-scraper").call(run_input={
-            "startUrls": [{"url": u} for u in FACEBOOK_GROUPS],
-            "resultsLimit": 40, "maxComments": 0,
-        })
+    # One run per group — a single run with multiple URLs hits resultsLimit total, not per-group
+    for group_url in FACEBOOK_GROUPS:
+        if _apify_limit_hit: break
+        logger.info(f"  Facebook: {group_url}")
+        try:
+            run = client.actor("apify/facebook-groups-scraper").call(run_input={
+                "startUrls": [{"url": group_url}],
+                "resultsLimit": 40, "maxComments": 0,
+            })
+        except Exception as e:
+            if "Monthly usage hard limit" in str(e):
+                logger.error("Apify monthly limit hit"); _apify_limit_hit = True; break
+            else:
+                logger.error(f"Facebook error ({group_url}): {e}"); continue
         for post in client.dataset(run["defaultDatasetId"]).iterate_items():
             text = post.get("text") or post.get("message", "")
             url  = post.get("url") or post.get("postUrl", "")
             if text and any(kw in text.lower() for kw in KEYWORDS):
                 items.append({"platform": "facebook", "url": url, "text": text})
-        logger.info(f"Facebook: {len(items)} matching posts")
-    except Exception as e:
-        if "Monthly usage hard limit" in str(e):
-            logger.error("Apify monthly limit hit"); _apify_limit_hit = True
-        else:
-            logger.error(f"Facebook error: {e}")
+        time.sleep(2)
+    logger.info(f"Facebook: {len(items)} matching posts")
     return items
 
 def discover_subreddits() -> list[str]:
