@@ -5,8 +5,8 @@ Markets:   USA · UK · Canada
 Leads → Slack (copy-paste ready) + Supabase + Make.com
 
 v6 changes vs v5:
-- Gemini upgraded to Tier 1 Prepay — ALL rate limiting removed
-  (no GEMINI_MIN_GAP, no BATCH_SIZE/BATCH_PAUSE, no RETRY_WAITS)
+- Gemini upgraded to gemini-2.5-flash (replaces deprecated gemini-2.0-flash)
+- Gemini on Tier 1 Prepay — ALL rate limiting removed
 - ask_gemini() simplified to single try/except, no retry loops
 - run_pipeline() batch pause block removed
 - Daily quota abort flag removed (not needed on paid tier)
@@ -153,14 +153,15 @@ class LeadOutput(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# GEMINI  —  PAID TIER (Tier 1 Prepay)
-# No rate limiting needed — 1000 requests/min on paid tier
+# GEMINI — gemini-2.5-flash (replaces deprecated 2.0-flash)
+# Tier 1 Prepay — no rate limiting needed
 # ═══════════════════════════════════════════════════════════
+GEMINI_MODEL = "gemini-2.5-flash-preview-05-20"
 
 def ask_gemini(prompt: str) -> dict:
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=900),
         )
@@ -412,14 +413,11 @@ async def deliver_lead(lead: LeadOutput):
 # ═══════════════════════════════════════════════════════════
 # SCRAPERS
 # ═══════════════════════════════════════════════════════════
-
-# Flag to stop all Apify scrapers if monthly limit is hit
 _apify_limit_hit = False
 
 def scrape_facebook_groups(since_date: str) -> list[dict]:
     global _apify_limit_hit
-    if _apify_limit_hit:
-        return []
+    if _apify_limit_hit: return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
@@ -435,10 +433,8 @@ def scrape_facebook_groups(since_date: str) -> list[dict]:
                 items.append({"platform": "facebook", "url": url, "text": text})
         logger.info(f"Facebook: {len(items)} matching posts")
     except Exception as e:
-        msg = str(e)
-        if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
-            logger.error("Apify monthly limit hit — stopping all scraping")
-            _apify_limit_hit = True
+        if "Monthly usage hard limit" in str(e):
+            logger.error("Apify monthly limit hit"); _apify_limit_hit = True
         else:
             logger.error(f"Facebook error: {e}")
     return items
@@ -452,8 +448,7 @@ def discover_subreddits() -> list[str]:
                 f"https://www.reddit.com/subreddits/search.json?q={term}&limit=10&sort=relevance",
                 headers=headers, timeout=15,
             )
-            if r.status_code != 200:
-                continue
+            if r.status_code != 200: continue
             for child in r.json().get("data", {}).get("children", []):
                 d    = child.get("data", {})
                 name = d.get("display_name", "")
@@ -473,19 +468,16 @@ def discover_subreddits() -> list[str]:
 
 def scrape_reddit(since_date: str) -> list[dict]:
     global _apify_limit_hit
-    if _apify_limit_hit:
-        return []
+    if _apify_limit_hit: return []
     from apify_client import ApifyClient
     client     = ApifyClient(get_apify_token())
     items      = []
     subreddits = discover_subreddits()
     if not subreddits:
-        logger.warning("No subreddits found — skipping Reddit")
-        return []
+        logger.warning("No subreddits found — skipping Reddit"); return []
     try:
         for sub in subreddits:
-            if _apify_limit_hit:
-                break
+            if _apify_limit_hit: break
             logger.info(f"  Reddit: r/{sub}")
             try:
                 run = client.actor("trudax/reddit-scraper-lite").call(run_input={
@@ -493,11 +485,8 @@ def scrape_reddit(since_date: str) -> list[dict]:
                     "maxPostCount": 30, "maxCommentCount": 0, "afterDate": since_date,
                 })
             except Exception as e:
-                msg = str(e)
-                if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
-                    logger.error("Apify monthly limit hit — stopping all scraping")
-                    _apify_limit_hit = True
-                    break
+                if "Monthly usage hard limit" in str(e):
+                    logger.error("Apify monthly limit hit"); _apify_limit_hit = True; break
                 raise
             for post in client.dataset(run["defaultDatasetId"]).iterate_items():
                 combined = f"{post.get('title','')} {post.get('body','')}".lower()
@@ -515,15 +504,13 @@ def scrape_reddit(since_date: str) -> list[dict]:
 
 def scrape_tiktok() -> list[dict]:
     global _apify_limit_hit
-    if _apify_limit_hit:
-        return []
+    if _apify_limit_hit: return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
     try:
         for hashtag in TIKTOK_HASHTAGS:
-            if _apify_limit_hit:
-                break
+            if _apify_limit_hit: break
             logger.info(f"  TikTok: #{hashtag}")
             try:
                 run = client.actor("clockworks/free-tiktok-scraper").call(run_input={
@@ -531,11 +518,8 @@ def scrape_tiktok() -> list[dict]:
                     "shouldDownloadVideos": False, "shouldDownloadCovers": False,
                 })
             except Exception as e:
-                msg = str(e)
-                if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
-                    logger.error("Apify monthly limit hit — stopping TikTok scraping")
-                    _apify_limit_hit = True
-                    break
+                if "Monthly usage hard limit" in str(e):
+                    logger.error("Apify monthly limit hit"); _apify_limit_hit = True; break
                 raise
             for video in client.dataset(run["defaultDatasetId"]).iterate_items():
                 views   = video.get("playCount") or video.get("stats", {}).get("playCount", 9999)
@@ -543,8 +527,7 @@ def scrape_tiktok() -> list[dict]:
                 url     = video.get("webVideoUrl") or video.get("url", "")
                 author  = video.get("authorMeta", {})
                 bio     = author.get("signature", "") or author.get("bio", "")
-                if views > TIKTOK_MAX_VIEWS:
-                    continue
+                if views > TIKTOK_MAX_VIEWS: continue
                 if not any(s in (caption + bio).lower() for s in
                            ["restaurant","café","cafe","pizza","burger","food","kitchen","chef","menu","hospitality"]):
                     continue
@@ -562,8 +545,7 @@ def scrape_tiktok() -> list[dict]:
 
 def scrape_google_reviews() -> list[dict]:
     global _apify_limit_hit
-    if _apify_limit_hit:
-        return []
+    if _apify_limit_hit: return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
@@ -575,9 +557,9 @@ def scrape_google_reviews() -> list[dict]:
         for place in client.dataset(run["defaultDatasetId"]).iterate_items():
             rating = place.get("totalScore") or place.get("rating", 5)
             if rating and float(rating) <= 3.5:
-                name    = place.get("title", "")
-                url     = place.get("url") or place.get("website", "")
-                reviews = place.get("reviews", [{}])
+                name        = place.get("title", "")
+                url         = place.get("url") or place.get("website", "")
+                reviews     = place.get("reviews", [{}])
                 review_text = reviews[0].get("text", "") if reviews else ""
                 if url:
                     items.append({
@@ -586,18 +568,15 @@ def scrape_google_reviews() -> list[dict]:
                     })
         logger.info(f"Google: {len(items)} struggling restaurants")
     except Exception as e:
-        msg = str(e)
-        if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
-            logger.error("Apify monthly limit hit during Google scrape")
-            _apify_limit_hit = True
+        if "Monthly usage hard limit" in str(e):
+            logger.error("Apify monthly limit hit during Google scrape"); _apify_limit_hit = True
         else:
             logger.error(f"Google error: {e}")
     return items
 
 def scrape_trustpilot() -> list[dict]:
     global _apify_limit_hit
-    if _apify_limit_hit:
-        return []
+    if _apify_limit_hit: return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
@@ -619,8 +598,7 @@ def scrape_trustpilot() -> list[dict]:
 
 def scrape_yelp() -> list[dict]:
     global _apify_limit_hit
-    if _apify_limit_hit or not YELP_RESTAURANTS:
-        return []
+    if _apify_limit_hit or not YELP_RESTAURANTS: return []
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
@@ -646,7 +624,7 @@ _pipeline_lock = asyncio.Lock()
 
 async def run_pipeline(test_mode: bool = False):
     global _apify_limit_hit
-    _apify_limit_hit = False  # reset per run
+    _apify_limit_hit = False
 
     if _pipeline_lock.locked():
         logger.warning("⚠️  Pipeline already running — skipping duplicate call")
@@ -656,23 +634,23 @@ async def run_pipeline(test_mode: bool = False):
         start = time.monotonic()
         logger.info("=" * 60)
         logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v6")
+        logger.info(f"   Gemini model: {GEMINI_MODEL}")
         logger.info("   Platforms: Facebook · Reddit · TikTok · Google · TrustPilot")
         logger.info("   Markets:   🇺🇸 USA  🇬🇧 UK  🇨🇦 Canada")
-        logger.info("   Gemini: Tier 1 Prepay — no rate limiting")
         logger.info("=" * 60)
 
         if test_mode:
             logger.info("TEST MODE — no Apify credits used")
             raw_items = [
                 {"platform": "facebook", "url": "https://facebook.com/test1",
-                 "text": "I run a burger spot in Manchester. Instagram for 2 years, still only 80-100 views per video. Revenue down 25%."},
+                 "text": "I run a burger spot in Manchester. Instagram for 2 years, still only 80-100 views per video. Revenue down 25%. Just Eat taking 35% commission on every order too."},
                 {"platform": "reddit", "url": "https://reddit.com/test2",
-                 "text": "Running a burger joint in Austin TX. DoorDash is killing our margins and we barely have an Instagram presence."},
+                 "text": "Running a burger joint in Austin TX. DoorDash is killing our margins and we barely have an Instagram presence. No idea how to get more local customers."},
                 {"platform": "tiktok", "url": "https://tiktok.com/@leedscafe/video/123",
                  "text": "TikTok caption: Made 50 croissants today, trying to grow this account 😭\nBio: Owner of The Corner Café, Leeds\nViews: 47",
                  "tiktok_views": 47},
                 {"platform": "google", "url": "https://maps.google.com/?cid=test1",
-                 "text": "Google Maps: Mario's Pizza NYC (2.8★). Review: no social media presence at all."},
+                 "text": "Google Maps: Mario's Pizza NYC (2.8★). Review: no social media presence at all, found them by accident."},
             ]
         else:
             since_date = await get_last_run_date()
@@ -685,16 +663,15 @@ async def run_pipeline(test_mode: bool = False):
             if ACTIVE_PLATFORMS.get("yelp"):       raw_items += scrape_yelp()
 
             if _apify_limit_hit:
-                logger.warning("⚠️  Apify monthly limit hit — processing whatever was collected before cutoff")
+                logger.warning("⚠️  Apify monthly limit hit — processing whatever was collected")
 
-            seen   = await load_seen_urls()
-            before = len(raw_items)
+            seen      = await load_seen_urls()
+            before    = len(raw_items)
             raw_items = [i for i in raw_items if is_new(i.get("url", ""), seen)]
             logger.info(f"Dedup: {before - len(raw_items)} skipped, {len(raw_items)} new")
 
         n = len(raw_items)
         logger.info(f"Processing {n} items")
-
         qualified: list[LeadOutput] = []
 
         for i, item in enumerate(raw_items):
@@ -705,8 +682,7 @@ async def run_pipeline(test_mode: bool = False):
             )
             if lead:
                 qualified.append(lead)
-                logger.info(f"  ✅ QUALIFIED — Score:{lead.intent_score} | "
-                            f"{lead.market} | {lead.problem_category}")
+                logger.info(f"  ✅ QUALIFIED — Score:{lead.intent_score} | {lead.market} | {lead.problem_category}")
 
         logger.info(f"\n{'='*60}")
         logger.info(f"Qualified: {len(qualified)} / {n}")
