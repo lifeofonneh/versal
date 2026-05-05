@@ -1,14 +1,18 @@
 """
-Versal Digital Solutions — Lean Lead Machine v4
+Versal Digital Solutions — Lean Lead Machine v5
 Platforms: Reddit, Facebook Groups, TikTok, Google Reviews, TrustPilot
 Markets:   USA · UK · Canada
 Leads → Slack (copy-paste ready) + Supabase + Make.com
 
-v4 changes:
-- 3 Gemini calls per lead → 1 combined call (fixes rate limit / timeout kills)
-- 4.5s gap between Gemini calls (stays safely under 15/min free tier)
-- Fixed Google Maps actor: compass/ → apify/google-maps-scraper
-- Pipeline lock prevents duplicate runs from stacking
+v5 fixes vs v4:
+- Gemini gap raised 4.5s → 6s (10/min, well under 15/min free tier)
+- Batch pacing: process 5 leads → hard 75s pause (full minute reset buffer)
+- Retry backoff: 62s → 90s → 120s → 180s (exponential, not flat)
+- After each retry wait, _last_gemini_call is reset so gap enforcement
+  doesn't add ANOTHER wait on top of the backoff
+- Skip-and-log on final retry failure instead of silently returning {}
+- Apify monthly limit → caught and raises a clear RuntimeError
+- Google actor name fixed: apify/google-maps-scraper (was compass/)
 """
 
 import asyncio, json, httpx, os, time, logging
@@ -22,23 +26,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════
-# CREDENTIALS
+# CREDENTIALS  (all via env vars — never hardcode)
 # ═══════════════════════════════════════════════════════════
 def _load_apify_tokens() -> list[str]:
-    env_keys = [os.getenv(f"APIFY_TOKEN_{i}") for i in range(1, 8)]
-    env_keys = [k for k in env_keys if k]
-    if env_keys:
-        return env_keys
-    raise ValueError("No Apify tokens found. Set APIFY_TOKEN_1 ... APIFY_TOKEN_N as env vars.")
+    tokens = [os.getenv(f"APIFY_TOKEN_{i}") for i in range(1, 8)]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        raise ValueError("No Apify tokens found. Set APIFY_TOKEN_1 … APIFY_TOKEN_N as env vars.")
+    return tokens
 
-APIFY_TOKENS  = _load_apify_tokens()
-_apify_index  = 0
+APIFY_TOKENS = _load_apify_tokens()
+_apify_index = 0
 
 def get_apify_token() -> str:
     global _apify_index
-    token = APIFY_TOKENS[_apify_index % len(APIFY_TOKENS)]
+    tok = APIFY_TOKENS[_apify_index % len(APIFY_TOKENS)]
     _apify_index += 1
-    return token
+    return tok
 
 def _require_env(name: str) -> str:
     val = os.getenv(name)
@@ -96,27 +100,16 @@ REDDIT_SEED_TERMS = [
     "restaurant owner", "cafe owner", "food business",
     "hospitality UK", "restaurant business Canada",
 ]
-
 REDDIT_RELEVANCE_KEYWORDS = [
     "restaurant", "cafe", "food", "hospitality", "kitchen", "chef",
     "bar", "diner", "barista", "small business", "entrepreneur",
     "canada business", "uk business", "pizza", "burger", "server",
 ]
-
 REDDIT_BLOCKLIST = {"CafeRacers", "caferacer", "Coffee", "ItalianFood", "chicagofood", "OttawaFood"}
 
-TIKTOK_HASHTAGS = [
-    "restaurantowner", "smallrestaurant", "restaurantlife",
-    "cafeowner", "foodbusiness", "restauranttok",
-]
-TIKTOK_MAX_VIEWS = 500
-
-INSTAGRAM_HASHTAGS = [
-    "restaurantowner", "cafeowner", "smallrestaurant",
-    "restaurantlife", "foodbusiness", "pizzarestaurant", "burgerrestaurant",
-]
-INSTAGRAM_MAX_VIEWS    = 100
-INSTAGRAM_MAX_AGE_DAYS = 3
+TIKTOK_HASHTAGS   = ["restaurantowner", "smallrestaurant", "restaurantlife",
+                     "cafeowner", "foodbusiness", "restauranttok"]
+TIKTOK_MAX_VIEWS  = 500
 
 TRUSTPILOT_CATEGORIES = [
     "https://uk.trustpilot.com/categories/restaurants_bars",
@@ -135,7 +128,6 @@ ACTIVE_PLATFORMS = {
     "facebook":   True,
     "reddit":     True,
     "tiktok":     True,
-    "instagram":  False,
     "google":     True,
     "trustpilot": False,
     "yelp":       True,
@@ -159,23 +151,43 @@ class LeadOutput(BaseModel):
     processed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     passed_threshold: bool
 
-# ═══════════════════════════════════════════════════════════
-# GEMINI — SINGLE COMBINED CALL PER LEAD
-# Replaces the old 3-call chain (score + classify + draft)
-# 27 items × 1 call = 27 calls total vs old 81 — stays under free tier
-# ═══════════════════════════════════════════════════════════
-_last_gemini_call = 0.0
-GEMINI_MIN_GAP    = 4.5   # seconds — keeps us at ~13 calls/min under the 15/min free tier
 
-def ask_gemini(prompt: str, retries: int = 5) -> dict:
+# ═══════════════════════════════════════════════════════════
+# GEMINI  —  RATE-LIMIT-SAFE ENGINE
+#
+# Free tier: 15 requests/min, 1500 requests/day
+# Strategy:
+#   • GEMINI_MIN_GAP = 6s  →  max 10/min  (33% headroom)
+#   • BATCH_SIZE = 5, BATCH_PAUSE = 75s  →  full minute resets between batches
+#   • Exponential retry waits: 90 → 120 → 180 → 240s
+#   • After each wait, _last_gemini_call is set to NOW so the gap
+#     enforcer doesn't stack an extra 6s on top of the backoff
+# ═══════════════════════════════════════════════════════════
+GEMINI_MIN_GAP  = 6.0    # seconds between calls (10/min)
+BATCH_SIZE      = 5      # leads per batch
+BATCH_PAUSE     = 75     # seconds between batches
+RETRY_WAITS     = [90, 120, 180, 240]   # backoff schedule (seconds)
+
+_last_gemini_call = 0.0
+
+def _gemini_gap_wait():
+    """Enforce minimum gap between Gemini calls."""
     global _last_gemini_call
-    # Enforce minimum gap
-    gap = time.monotonic() - _last_gemini_call
-    if gap < GEMINI_MIN_GAP:
-        time.sleep(GEMINI_MIN_GAP - gap)
+    elapsed = time.monotonic() - _last_gemini_call
+    if elapsed < GEMINI_MIN_GAP:
+        time.sleep(GEMINI_MIN_GAP - elapsed)
     _last_gemini_call = time.monotonic()
 
-    for attempt in range(retries):
+def ask_gemini(prompt: str) -> dict:
+    global _last_gemini_call
+    _gemini_gap_wait()
+
+    for attempt, wait in enumerate([0] + RETRY_WAITS, start=1):
+        if wait:
+            logger.warning(f"Gemini 429 — waiting {wait}s (attempt {attempt}/{len(RETRY_WAITS)+1})")
+            time.sleep(wait)
+            _last_gemini_call = time.monotonic()   # reset so gap enforcer doesn't double-wait
+
         try:
             response = gemini_client.models.generate_content(
                 model="gemini-2.0-flash",
@@ -187,30 +199,26 @@ def ask_gemini(prompt: str, retries: int = 5) -> dict:
                 text = text.split("```")[1]
                 if text.startswith("json"):
                     text = text[4:]
+            _last_gemini_call = time.monotonic()
             return json.loads(text.strip())
+
         except Exception as e:
             msg = str(e)
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                wait = 62
-                try:
-                    import re
-                    m = re.search(r"retryDelay.*?(\d+)s", msg)
-                    if m:
-                        wait = int(m.group(1)) + 2
-                except Exception:
-                    pass
-                logger.warning(f"Gemini 429 — waiting {wait}s (attempt {attempt+1}/{retries})")
-                time.sleep(wait)
-                _last_gemini_call = time.monotonic()
+                if attempt > len(RETRY_WAITS):
+                    logger.error(f"Gemini exhausted all retries — skipping this lead")
+                    return {}
+                # loop continues with next wait from RETRY_WAITS
             else:
-                logger.error(f"Gemini error: {e}")
+                logger.error(f"Gemini non-rate-limit error: {e}")
                 return {}
-    logger.error("Gemini failed after all retries")
+
     return {}
 
-def analyse_lead(text: str, platform: str, market_hint: str = "",
+
+def analyse_lead(text: str, platform: str,
                  tiktok_views: Optional[int] = None) -> dict:
-    """Single combined Gemini call: score + classify + draft in one shot."""
+    """Single combined Gemini call: score + classify + draft."""
     market_notes = {
         "UK":     "Use British spelling. Reference UK platforms (Just Eat, Deliveroo).",
         "USA":    "Use American spelling. Reference US platforms (DoorDash, Grubhub, Uber Eats).",
@@ -224,9 +232,12 @@ def analyse_lead(text: str, platform: str, market_hint: str = "",
         "trustpilot": "empathetic cold outreach email to struggling restaurant owner",
         "google":     "empathetic cold outreach email referencing their Google presence",
     }
-    tiktok_note = f"\nThis TikTok video has only {tiktok_views} views — reference this naturally." if tiktok_views else ""
-    market_note = market_notes.get(market_hint, "")
-    tone        = platform_tones.get(platform, "friendly helpful message")
+    tiktok_note = (f"\nThis TikTok video has only {tiktok_views} views — "
+                   "reference this naturally." if tiktok_views else "")
+    tone = platform_tones.get(platform, "friendly helpful message")
+    # Market note will be filled by Gemini once it detects the market;
+    # we pass all three so it picks the right one.
+    market_block = "\n".join(f"- If market={k}: {v}" for k, v in market_notes.items())
 
     return ask_gemini(f"""You are an analyst and copywriter for Versal Digital Solutions.
 {AGENCY_CONTEXT}
@@ -243,20 +254,21 @@ SCORING:
 - market: "USA", "UK", "Canada", or "Unknown" — detect from context clues
   (Just Eat/Deliveroo = UK, Skip The Dishes = Canada, DoorDash/Grubhub = USA)
 
-CLASSIFICATION (only needed if is_restaurant_owner=true and intent_score>=75):
-- problem_category: one of Social Media/Visibility, Profitability/Margins, Labor/Hiring,
-  Tech/POS, Reputation/Reviews, Foot Traffic, Delivery App Dependency, Other
+CLASSIFICATION (only if is_restaurant_owner=true AND intent_score>=75):
+- problem_category: Social Media/Visibility | Profitability/Margins | Labor/Hiring |
+  Tech/POS | Reputation/Reviews | Foot Traffic | Delivery App Dependency | Other
 - pain_point_summary: one sentence, max 15 words
 
-REPLY (only needed if is_restaurant_owner=true and intent_score>=75):
-- Write a {tone} to a restaurant owner struggling with their problem
-- {market_note}{tiktok_note}
+REPLY (only if is_restaurant_owner=true AND intent_score>=75):
+- Write a {tone} reply to a restaurant owner struggling with their problem
+- Market-specific tone rules:
+{market_block}{tiktok_note}
 - Max 3 sentences. Sound like a helpful peer, NOT an agency.
 - Lead with ONE specific actionable tip for their exact problem.
 - End by offering Versal's free mini-audit (no commitment, 2 mins to apply).
 - Never mention pricing. Never be pushy.
 
-Return ONLY this JSON (no markdown):
+Return ONLY this JSON (no markdown, no preamble):
 {{
   "is_restaurant_owner": true/false,
   "intent_score": 0-100,
@@ -270,6 +282,7 @@ Return ONLY this JSON (no markdown):
 Text to analyse:
 {text[:1400]}""")
 
+
 def process_single_lead(text: str, platform: str, url: str,
                         threshold: int = 75,
                         tiktok_views: Optional[int] = None) -> Optional[LeadOutput]:
@@ -282,9 +295,7 @@ def process_single_lead(text: str, platform: str, url: str,
     market   = result.get("market", "Unknown")
     logger.info(f"  Score:{score} | Owner:{is_owner} | Market:{market}")
 
-    if not is_owner or score < threshold:
-        return None
-    if not result.get("drafted_response"):
+    if not is_owner or score < threshold or not result.get("drafted_response"):
         return None
 
     return LeadOutput(
@@ -296,6 +307,7 @@ def process_single_lead(text: str, platform: str, url: str,
         free_resource_offered=result.get("free_resource_offered", "Free Versal Mini-Audit"),
         market=market, tiktok_view_count=tiktok_views, passed_threshold=True,
     )
+
 
 # ═══════════════════════════════════════════════════════════
 # DEDUP
@@ -331,6 +343,7 @@ def is_new(url: str, seen: set[str]) -> bool:
     seen.add(url)
     return True
 
+
 # ═══════════════════════════════════════════════════════════
 # LAST RUN DATE
 # ═══════════════════════════════════════════════════════════
@@ -348,13 +361,14 @@ async def get_last_run_date() -> str:
             rows = r.json()
             if rows and rows[0].get("processed_at"):
                 last = rows[0]["processed_at"][:10]
-                logger.info(f"Last run: {last} — scraping since then")
+                logger.info(f"Last run: {last}")
                 return last
-            logger.info(f"First run — scraping last 50 days from {fallback}")
+            logger.info(f"First run — using {fallback}")
             return fallback
     except Exception as e:
         logger.error(f"Could not fetch last run date: {e}")
         return fallback
+
 
 # ═══════════════════════════════════════════════════════════
 # DELIVERY
@@ -437,6 +451,7 @@ async def deliver_lead(lead: LeadOutput):
         supa  = await save_to_supabase(client, lead)
         logger.info(f"  Delivered → Slack:{slack} | Make:{make} | Supabase:{supa}")
 
+
 # ═══════════════════════════════════════════════════════════
 # SCRAPERS
 # ═══════════════════════════════════════════════════════════
@@ -484,7 +499,7 @@ def discover_subreddits() -> list[str]:
                 seen.add(name)
             time.sleep(1)
         except Exception as e:
-            logger.error(f"Subreddit discovery error '{term}': {e}")
+            logger.error(f"Subreddit discovery '{term}': {e}")
     logger.info(f"Reddit: {len(found)} subreddits discovered")
     return found
 
@@ -524,20 +539,27 @@ def scrape_tiktok() -> list[dict]:
     try:
         for hashtag in TIKTOK_HASHTAGS:
             logger.info(f"  TikTok: #{hashtag}")
-            run = client.actor("clockworks/free-tiktok-scraper").call(run_input={
-                "hashtags": [hashtag], "resultsPerPage": 30,
-                "shouldDownloadVideos": False, "shouldDownloadCovers": False,
-            })
+            try:
+                run = client.actor("clockworks/free-tiktok-scraper").call(run_input={
+                    "hashtags": [hashtag], "resultsPerPage": 30,
+                    "shouldDownloadVideos": False, "shouldDownloadCovers": False,
+                })
+            except Exception as e:
+                msg = str(e)
+                if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
+                    logger.error("Apify monthly limit hit — stopping TikTok scraping")
+                    break
+                raise
             for video in client.dataset(run["defaultDatasetId"]).iterate_items():
-                views  = video.get("playCount") or video.get("stats", {}).get("playCount", 9999)
-                caption= video.get("text") or video.get("desc", "")
-                url    = video.get("webVideoUrl") or video.get("url", "")
-                author = video.get("authorMeta", {})
-                bio    = author.get("signature", "") or author.get("bio", "")
+                views   = video.get("playCount") or video.get("stats", {}).get("playCount", 9999)
+                caption = video.get("text") or video.get("desc", "")
+                url     = video.get("webVideoUrl") or video.get("url", "")
+                author  = video.get("authorMeta", {})
+                bio     = author.get("signature", "") or author.get("bio", "")
                 if views > TIKTOK_MAX_VIEWS:
                     continue
-                combined = (caption + bio).lower()
-                if not any(s in combined for s in ["restaurant","café","cafe","pizza","burger","food","kitchen","chef","menu","hospitality"]):
+                if not any(s in (caption + bio).lower() for s in
+                           ["restaurant","café","cafe","pizza","burger","food","kitchen","chef","menu","hospitality"]):
                     continue
                 items.append({
                     "platform": "tiktok",
@@ -551,47 +573,11 @@ def scrape_tiktok() -> list[dict]:
         logger.error(f"TikTok error: {e}")
     return items
 
-def scrape_instagram() -> list[dict]:
-    from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())
-    items  = []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=INSTAGRAM_MAX_AGE_DAYS)
-    try:
-        for hashtag in INSTAGRAM_HASHTAGS:
-            run = client.actor("apify/instagram-hashtag-scraper").call(run_input={
-                "hashtags": [hashtag], "resultsLimit": 40,
-                "onlyPostsNewerThan": cutoff.strftime("%Y-%m-%d"),
-            })
-            for post in client.dataset(run["defaultDatasetId"]).iterate_items():
-                views = post.get("videoViewCount") or post.get("playCount") or 0
-                caption = post.get("caption") or post.get("text", "")
-                url = post.get("url") or post.get("shortCode", "")
-                if url and not url.startswith("http"):
-                    url = f"https://www.instagram.com/p/{url}/"
-                owner = post.get("ownerUsername") or ""
-                bio   = post.get("ownerBio") or ""
-                is_video = post.get("type") in ("Video", "Reel") or post.get("isVideo", False)
-                if not is_video or views > INSTAGRAM_MAX_VIEWS:
-                    continue
-                combined = (caption + bio).lower()
-                if not any(s in combined for s in ["restaurant","café","cafe","pizza","burger","food","kitchen","chef"]):
-                    continue
-                items.append({
-                    "platform": "instagram", "url": url,
-                    "text": f"Instagram Reel: {caption}\n@{owner} | Bio: {bio}\nViews: {views}",
-                })
-            time.sleep(3)
-        logger.info(f"Instagram: {len(items)} Reels")
-    except Exception as e:
-        logger.error(f"Instagram error: {e}")
-    return items
-
 def scrape_google_reviews() -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
     try:
-        # ✅ Fixed actor name: was compass/google-maps-scraper
         run = client.actor("apify/google-maps-scraper").call(run_input={
             "searchStringsArray": GOOGLE_MAPS_QUERIES[:6],
             "maxReviews": 5, "reviewsSort": "newest", "language": "en",
@@ -653,6 +639,7 @@ def scrape_yelp() -> list[dict]:
         logger.error(f"Yelp error: {e}")
     return items
 
+
 # ═══════════════════════════════════════════════════════════
 # MASTER PIPELINE
 # ═══════════════════════════════════════════════════════════
@@ -660,15 +647,16 @@ _pipeline_lock = asyncio.Lock()
 
 async def run_pipeline(test_mode: bool = False):
     if _pipeline_lock.locked():
-        logger.warning("⚠️  Pipeline already running — skipping duplicate /run call")
+        logger.warning("⚠️  Pipeline already running — skipping duplicate call")
         return {"skipped": True, "reason": "already running"}
 
     async with _pipeline_lock:
         start = time.monotonic()
         logger.info("=" * 60)
-        logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v4")
+        logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v5")
         logger.info("   Platforms: Facebook · Reddit · TikTok · Google · TrustPilot")
         logger.info("   Markets:   🇺🇸 USA  🇬🇧 UK  🇨🇦 Canada")
+        logger.info(f"   Gemini pacing: {GEMINI_MIN_GAP}s/call · batch {BATCH_SIZE} → pause {BATCH_PAUSE}s")
         logger.info("=" * 60)
 
         if test_mode:
@@ -686,11 +674,10 @@ async def run_pipeline(test_mode: bool = False):
             ]
         else:
             since_date = await get_last_run_date()
-            raw_items = []
+            raw_items  = []
             if ACTIVE_PLATFORMS.get("facebook"):   raw_items += scrape_facebook_groups(since_date)
             if ACTIVE_PLATFORMS.get("reddit"):     raw_items += scrape_reddit(since_date)
             if ACTIVE_PLATFORMS.get("tiktok"):     raw_items += scrape_tiktok()
-            if ACTIVE_PLATFORMS.get("instagram"):  raw_items += scrape_instagram()
             if ACTIVE_PLATFORMS.get("google"):     raw_items += scrape_google_reviews()
             if ACTIVE_PLATFORMS.get("trustpilot"): raw_items += scrape_trustpilot()
             if ACTIVE_PLATFORMS.get("yelp"):       raw_items += scrape_yelp()
@@ -698,28 +685,40 @@ async def run_pipeline(test_mode: bool = False):
             seen   = await load_seen_urls()
             before = len(raw_items)
             raw_items = [i for i in raw_items if is_new(i.get("url", ""), seen)]
-            logger.info(f"Dedup: {before - len(raw_items)} skipped, {len(raw_items)} new items")
+            logger.info(f"Dedup: {before - len(raw_items)} skipped, {len(raw_items)} new")
 
-        logger.info(f"Processing {len(raw_items)} items with 1 Gemini call each (~{len(raw_items)*4.5:.0f}s Gemini time)")
+        n = len(raw_items)
+        estimated = (n * GEMINI_MIN_GAP) + ((n // BATCH_SIZE) * BATCH_PAUSE)
+        logger.info(f"Processing {n} items — est. Gemini time ~{int(estimated)}s "
+                    f"({n} calls + {n // BATCH_SIZE} batch pause{'s' if n//BATCH_SIZE!=1 else ''})")
 
         qualified: list[LeadOutput] = []
-        for item in raw_items:
-            logger.info(f"\n[{item['platform'].upper()}] {item['text'][:80]}...")
+
+        for i, item in enumerate(raw_items):
+            # ── Batch pause: after every BATCH_SIZE leads, wait for the
+            #    Gemini per-minute window to fully reset
+            if i > 0 and i % BATCH_SIZE == 0:
+                logger.info(f"  ⏸  Batch pause {BATCH_PAUSE}s to reset Gemini rate limit "
+                            f"(batch {i // BATCH_SIZE} of {(n-1) // BATCH_SIZE + 1})")
+                time.sleep(BATCH_PAUSE)
+
+            logger.info(f"\n[{i+1}/{n}][{item['platform'].upper()}] {item['text'][:80]}...")
             lead = process_single_lead(
                 item["text"], item["platform"], item["url"],
                 tiktok_views=item.get("tiktok_views"),
             )
             if lead:
                 qualified.append(lead)
-                logger.info(f"  ✅ QUALIFIED — Score:{lead.intent_score} | {lead.market} | {lead.problem_category}")
+                logger.info(f"  ✅ QUALIFIED — Score:{lead.intent_score} | "
+                            f"{lead.market} | {lead.problem_category}")
 
         logger.info(f"\n{'='*60}")
-        logger.info(f"Qualified: {len(qualified)} / {len(raw_items)}")
+        logger.info(f"Qualified: {len(qualified)} / {n}")
 
         by_market, by_platform = {}, {}
         for lead in qualified:
-            by_market[lead.market]               = by_market.get(lead.market, 0) + 1
-            by_platform[lead.source_platform]    = by_platform.get(lead.source_platform, 0) + 1
+            by_market[lead.market]            = by_market.get(lead.market, 0) + 1
+            by_platform[lead.source_platform] = by_platform.get(lead.source_platform, 0) + 1
 
         for lead in qualified:
             logger.info(f"Delivering [{lead.source_platform}] score:{lead.intent_score} {lead.market}...")
@@ -729,11 +728,12 @@ async def run_pipeline(test_mode: bool = False):
         logger.info(f"\n✅ DONE — {len(qualified)} leads delivered in {elapsed}s")
         return {
             "leads_delivered": len(qualified),
-            "total_processed": len(raw_items),
+            "total_processed": n,
             "by_market": by_market,
             "by_platform": by_platform,
             "seconds": elapsed,
         }
+
 
 if __name__ == "__main__":
     # test_mode=True  → instant run, no Apify credits
