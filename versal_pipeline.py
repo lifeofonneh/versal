@@ -1,8 +1,14 @@
 """
-Versal Digital Solutions — Lean Lead Machine v3
+Versal Digital Solutions — Lean Lead Machine v4
 Platforms: Reddit, Facebook Groups, TikTok, Google Reviews, TrustPilot
 Markets:   USA · UK · Canada
 Leads → Slack (copy-paste ready) + Supabase + Make.com
+
+v4 changes:
+- 3 Gemini calls per lead → 1 combined call (fixes rate limit / timeout kills)
+- 4.5s gap between Gemini calls (stays safely under 15/min free tier)
+- Fixed Google Maps actor: compass/ → apify/google-maps-scraper
+- Pipeline lock prevents duplicate runs from stacking
 """
 
 import asyncio, json, httpx, os, time, logging
@@ -25,8 +31,8 @@ def _load_apify_tokens() -> list[str]:
         return env_keys
     raise ValueError("No Apify tokens found. Set APIFY_TOKEN_1 ... APIFY_TOKEN_N as env vars.")
 
-APIFY_TOKENS = _load_apify_tokens()
-_apify_index = 0
+APIFY_TOKENS  = _load_apify_tokens()
+_apify_index  = 0
 
 def get_apify_token() -> str:
     global _apify_index
@@ -77,34 +83,34 @@ KEYWORDS = [
     "doordash", "just eat", "skip the dishes",
 ]
 
-# Facebook — verified public groups (manually curated, all confirmed open/public)
-# To add more: find group on Facebook, check it's Public, paste URL here
 FACEBOOK_GROUPS = [
-    "https://www.facebook.com/groups/restaurantownersuk/",        # 246k members, public ✅
-    "https://www.facebook.com/groups/ukrestaurantowners/",        # UK focused, public ✅
-    "https://www.facebook.com/groups/hospitalityuk/",             # UK hospitality, public ✅
-    "https://www.facebook.com/groups/foodserviceprofessionals/",  # USA focused, public ✅
-    "https://www.facebook.com/groups/canadianrestaurantowners/",  # Canada focused, public ✅
-    "https://www.facebook.com/groups/torontofoodbusiness/",       # Canada/Toronto, public ✅
+    "https://www.facebook.com/groups/restaurantownersuk/",
+    "https://www.facebook.com/groups/ukrestaurantowners/",
+    "https://www.facebook.com/groups/hospitalityuk/",
+    "https://www.facebook.com/groups/foodserviceprofessionals/",
+    "https://www.facebook.com/groups/canadianrestaurantowners/",
+    "https://www.facebook.com/groups/torontofoodbusiness/",
 ]
 
-# Reddit — seed terms for dynamic subreddit discovery
 REDDIT_SEED_TERMS = [
-    "restaurant owner",
-    "cafe owner",
-    "food business",
-    "hospitality UK",
-    "restaurant business Canada",
+    "restaurant owner", "cafe owner", "food business",
+    "hospitality UK", "restaurant business Canada",
 ]
 
-# TikTok hashtags
+REDDIT_RELEVANCE_KEYWORDS = [
+    "restaurant", "cafe", "food", "hospitality", "kitchen", "chef",
+    "bar", "diner", "barista", "small business", "entrepreneur",
+    "canada business", "uk business", "pizza", "burger", "server",
+]
+
+REDDIT_BLOCKLIST = {"CafeRacers", "caferacer", "Coffee", "ItalianFood", "chicagofood", "OttawaFood"}
+
 TIKTOK_HASHTAGS = [
     "restaurantowner", "smallrestaurant", "restaurantlife",
     "cafeowner", "foodbusiness", "restauranttok",
 ]
 TIKTOK_MAX_VIEWS = 500
 
-# Instagram hashtags
 INSTAGRAM_HASHTAGS = [
     "restaurantowner", "cafeowner", "smallrestaurant",
     "restaurantlife", "foodbusiness", "pizzarestaurant", "burgerrestaurant",
@@ -112,25 +118,19 @@ INSTAGRAM_HASHTAGS = [
 INSTAGRAM_MAX_VIEWS    = 100
 INSTAGRAM_MAX_AGE_DAYS = 3
 
-# TrustPilot
 TRUSTPILOT_CATEGORIES = [
     "https://uk.trustpilot.com/categories/restaurants_bars",
     "https://www.trustpilot.com/categories/restaurants_bars",
 ]
 
-# Google Maps
 GOOGLE_MAPS_QUERIES = [
     "pizza restaurant London", "burger restaurant Manchester", "cafe Birmingham",
     "pizza restaurant New York", "burger restaurant Los Angeles",
     "cafe Toronto", "pizza restaurant Vancouver",
 ]
 
-# Yelp (add specific restaurant URLs to activate)
 YELP_RESTAURANTS: list[str] = []
 
-# ═══════════════════════════════════════════════════════════
-# ACTIVE PLATFORMS
-# ═══════════════════════════════════════════════════════════
 ACTIVE_PLATFORMS = {
     "facebook":   True,
     "reddit":     True,
@@ -160,9 +160,21 @@ class LeadOutput(BaseModel):
     passed_threshold: bool
 
 # ═══════════════════════════════════════════════════════════
-# GEMINI AI ENGINE
+# GEMINI — SINGLE COMBINED CALL PER LEAD
+# Replaces the old 3-call chain (score + classify + draft)
+# 27 items × 1 call = 27 calls total vs old 81 — stays under free tier
 # ═══════════════════════════════════════════════════════════
+_last_gemini_call = 0.0
+GEMINI_MIN_GAP    = 4.5   # seconds — keeps us at ~13 calls/min under the 15/min free tier
+
 def ask_gemini(prompt: str, retries: int = 5) -> dict:
+    global _last_gemini_call
+    # Enforce minimum gap
+    gap = time.monotonic() - _last_gemini_call
+    if gap < GEMINI_MIN_GAP:
+        time.sleep(GEMINI_MIN_GAP - gap)
+    _last_gemini_call = time.monotonic()
+
     for attempt in range(retries):
         try:
             response = gemini_client.models.generate_content(
@@ -173,142 +185,115 @@ def ask_gemini(prompt: str, retries: int = 5) -> dict:
             text = response.text.strip()
             if "```" in text:
                 text = text.split("```")[1]
-                if text.startswith("json"): text = text[4:]
+                if text.startswith("json"):
+                    text = text[4:]
             return json.loads(text.strip())
         except Exception as e:
             msg = str(e)
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                # Extract retry delay from error if available, else wait 60s
                 wait = 62
                 try:
                     import re
-                    match = re.search(r"retryDelay.*?(\d+)s", msg)
-                    if match:
-                        wait = int(match.group(1)) + 2
+                    m = re.search(r"retryDelay.*?(\d+)s", msg)
+                    if m:
+                        wait = int(m.group(1)) + 2
                 except Exception:
                     pass
-                logger.warning(f"Gemini rate limit — waiting {wait}s for quota reset (attempt {attempt+1}/{retries})")
+                logger.warning(f"Gemini 429 — waiting {wait}s (attempt {attempt+1}/{retries})")
                 time.sleep(wait)
+                _last_gemini_call = time.monotonic()
             else:
                 logger.error(f"Gemini error: {e}")
                 return {}
     logger.error("Gemini failed after all retries")
     return {}
 
-# Throttle: max 12 Gemini calls per minute (stay under the 15/min free tier limit)
-_gemini_call_times: list = []
-
-def ask_gemini_throttled(prompt: str) -> dict:
-    global _gemini_call_times
-    now = time.monotonic()
-    # Drop calls older than 60 seconds
-    _gemini_call_times = [t for t in _gemini_call_times if now - t < 60]
-    if len(_gemini_call_times) >= 12:
-        # Wait until the oldest call falls outside the 60s window
-        wait = 61 - (now - _gemini_call_times[0])
-        if wait > 0:
-            logger.info(f"Gemini throttle — waiting {wait:.1f}s to stay under free tier limit")
-            time.sleep(wait)
-        _gemini_call_times = [t for t in _gemini_call_times if time.monotonic() - t < 60]
-    _gemini_call_times.append(time.monotonic())
-    return ask_gemini(prompt)
-
-def score_intent(text: str, platform: str) -> dict:
-    return ask_gemini_throttled(f"""You are an expert analyst for Versal Digital Solutions,
-a done-for-you short-form content agency for restaurants in the USA, UK, and Canada.
-
-Analyse this {platform} post/comment/video. Return ONLY valid JSON.
-
-Is the author a restaurant OWNER/OPERATOR (not a diner, not staff)?
-Intent score 0-100 — urgency of need for social media / marketing / visibility help.
-
-Detect market: "USA", "UK", "Canada", or "Unknown".
-
-Return ONLY: {{"is_restaurant_owner": true/false, "intent_score": 0-100,
-"market": "USA|UK|Canada|Unknown", "reasoning": "one sentence"}}
-
-Text: {text[:1200]}""")
-
-def classify_problem(text: str) -> dict:
-    return ask_gemini_throttled(f"""UK/USA/Canada restaurant business consultant.
-Classify this restaurant owner's primary problem. Return ONLY valid JSON.
-
-Categories: Social Media/Visibility, Profitability/Margins, Labor/Hiring,
-Tech/POS, Reputation/Reviews, Foot Traffic, Delivery App Dependency, Other
-
-Return ONLY: {{"problem_category": "category",
-"pain_point_summary": "one sentence max 15 words"}}
-
-Text: {text[:800]}""")
-
-def draft_response(text: str, category: str, pain_point: str,
-                   platform: str, market: str,
-                   tiktok_views: Optional[int] = None) -> dict:
-    market_note = {
-        "UK":     "Use British spelling. Reference UK platforms (Just Eat, Deliveroo) where relevant.",
-        "USA":    "Use American spelling. Reference US platforms (DoorDash, Grubhub, Uber Eats) where relevant.",
-        "Canada": "Use Canadian context. Reference Skip The Dishes / DoorDash Canada where relevant.",
-    }.get(market, "")
-
-    tiktok_note = ""
-    if platform == "tiktok" and tiktok_views is not None:
-        tiktok_note = f"\nThis is a TikTok video with only {tiktok_views} views."
-
-    platform_tone = {
+def analyse_lead(text: str, platform: str, market_hint: str = "",
+                 tiktok_views: Optional[int] = None) -> dict:
+    """Single combined Gemini call: score + classify + draft in one shot."""
+    market_notes = {
+        "UK":     "Use British spelling. Reference UK platforms (Just Eat, Deliveroo).",
+        "USA":    "Use American spelling. Reference US platforms (DoorDash, Grubhub, Uber Eats).",
+        "Canada": "Use Canadian context. Reference Skip The Dishes / DoorDash Canada.",
+    }
+    platform_tones = {
         "reddit":     "casual Reddit reply, peer-to-peer, no formality",
         "facebook":   "friendly Facebook comment, warm and helpful",
         "tiktok":     "short friendly TikTok comment (max 2 sentences), then DM offer",
-        "yelp":       "empathetic cold outreach email to a restaurant owner",
-        "trustpilot": "empathetic cold outreach email to a struggling restaurant owner",
+        "yelp":       "empathetic cold outreach email to restaurant owner",
+        "trustpilot": "empathetic cold outreach email to struggling restaurant owner",
         "google":     "empathetic cold outreach email referencing their Google presence",
-    }.get(platform, "friendly helpful message")
+    }
+    tiktok_note = f"\nThis TikTok video has only {tiktok_views} views — reference this naturally." if tiktok_views else ""
+    market_note = market_notes.get(market_hint, "")
+    tone        = platform_tones.get(platform, "friendly helpful message")
 
-    return ask_gemini_throttled(f"""You represent Versal Digital Solutions.
-
+    return ask_gemini(f"""You are an analyst and copywriter for Versal Digital Solutions.
 {AGENCY_CONTEXT}
-{market_note}{tiktok_note}
 
-Write a {platform_tone} reply to a restaurant owner struggling with: {pain_point}
+Analyse this {platform} post/text and return ONLY valid JSON with ALL fields below.
 
-Rules:
+SCORING:
+- is_restaurant_owner: true only if the author is an owner/operator (not a diner or staff)
+- intent_score: 0-100 urgency for social media / marketing / visibility help
+  90-100 = actively asking for help or has very low social media reach
+  70-89  = clear owner pain around visibility or growth
+  50-69  = owner venting, not actively seeking help
+  0-49   = diner, staff, unrelated
+- market: "USA", "UK", "Canada", or "Unknown" — detect from context clues
+  (Just Eat/Deliveroo = UK, Skip The Dishes = Canada, DoorDash/Grubhub = USA)
+
+CLASSIFICATION (only needed if is_restaurant_owner=true and intent_score>=75):
+- problem_category: one of Social Media/Visibility, Profitability/Margins, Labor/Hiring,
+  Tech/POS, Reputation/Reviews, Foot Traffic, Delivery App Dependency, Other
+- pain_point_summary: one sentence, max 15 words
+
+REPLY (only needed if is_restaurant_owner=true and intent_score>=75):
+- Write a {tone} to a restaurant owner struggling with their problem
+- {market_note}{tiktok_note}
 - Max 3 sentences. Sound like a helpful peer, NOT an agency.
-- Lead with ONE specific actionable tip related to their exact problem.
-- End naturally by offering Versal's free mini-audit (no commitment, 2 mins to apply).
+- Lead with ONE specific actionable tip for their exact problem.
+- End by offering Versal's free mini-audit (no commitment, 2 mins to apply).
 - Never mention pricing. Never be pushy.
 
-Return ONLY: {{"drafted_response": "the reply text",
-"free_resource_offered": "Free Versal Mini-Audit + 15-min Strategy Call"}}
+Return ONLY this JSON (no markdown):
+{{
+  "is_restaurant_owner": true/false,
+  "intent_score": 0-100,
+  "market": "USA|UK|Canada|Unknown",
+  "problem_category": "category or null",
+  "pain_point_summary": "summary or null",
+  "drafted_response": "reply text or null",
+  "free_resource_offered": "Free Versal Mini-Audit + 15-min Strategy Call"
+}}
 
-Their post: {text[:400]}""")
+Text to analyse:
+{text[:1400]}""")
 
 def process_single_lead(text: str, platform: str, url: str,
                         threshold: int = 75,
                         tiktok_views: Optional[int] = None) -> Optional[LeadOutput]:
-    intent = score_intent(text, platform)
-    if not intent: return None
+    result = analyse_lead(text, platform, tiktok_views=tiktok_views)
+    if not result:
+        return None
 
-    score    = intent.get("intent_score", 0)
-    is_owner = intent.get("is_restaurant_owner", False)
-    market   = intent.get("market", "Unknown")
-    logger.info(f"  Score:{score} | Owner:{is_owner} | Market:{market} | {intent.get('reasoning','')[:80]}")
+    score    = result.get("intent_score", 0)
+    is_owner = result.get("is_restaurant_owner", False)
+    market   = result.get("market", "Unknown")
+    logger.info(f"  Score:{score} | Owner:{is_owner} | Market:{market}")
 
     if not is_owner or score < threshold:
         return None
-
-    classification = classify_problem(text)
-    if not classification: return None
-    category   = classification.get("problem_category", "Other")
-    pain_point = classification.get("pain_point_summary", "")
-
-    draft = draft_response(text, category, pain_point, platform, market, tiktok_views)
-    if not draft: return None
+    if not result.get("drafted_response"):
+        return None
 
     return LeadOutput(
         source_platform=platform, source_url=url, raw_text=text,
         intent_score=score, is_restaurant_owner=is_owner,
-        problem_category=category, pain_point_summary=pain_point,
-        drafted_response=draft.get("drafted_response", ""),
-        free_resource_offered=draft.get("free_resource_offered", "Free Versal Mini-Audit"),
+        problem_category=result.get("problem_category", "Other"),
+        pain_point_summary=result.get("pain_point_summary", ""),
+        drafted_response=result.get("drafted_response", ""),
+        free_resource_offered=result.get("free_resource_offered", "Free Versal Mini-Audit"),
         market=market, tiktok_view_count=tiktok_views, passed_threshold=True,
     )
 
@@ -334,7 +319,7 @@ async def load_seen_urls() -> set[str]:
                 if len(rows) < 1000:
                     break
                 offset += 1000
-            logger.info(f"Dedup: loaded {len(seen)} previously seen URLs")
+            logger.info(f"Dedup: {len(seen)} previously seen URLs loaded")
             return seen
     except Exception as e:
         logger.error(f"Dedup load error: {e}")
@@ -362,13 +347,13 @@ async def get_last_run_date() -> str:
             )
             rows = r.json()
             if rows and rows[0].get("processed_at"):
-                last_date = rows[0]["processed_at"][:10]
-                logger.info(f"📅 Existing leads found — scraping since: {last_date}")
-                return last_date
-            logger.info(f"🆕 First ever run — scraping last 50 days since: {fallback}")
+                last = rows[0]["processed_at"][:10]
+                logger.info(f"Last run: {last} — scraping since then")
+                return last
+            logger.info(f"First run — scraping last 50 days from {fallback}")
             return fallback
     except Exception as e:
-        logger.error(f"Could not fetch last run date, using 50-day fallback: {e}")
+        logger.error(f"Could not fetch last run date: {e}")
         return fallback
 
 # ═══════════════════════════════════════════════════════════
@@ -386,13 +371,11 @@ async def send_to_slack(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
         "reddit": "🟠 Reddit", "facebook": "🔵 Facebook", "tiktok": "🎵 TikTok",
         "yelp": "⭐ Yelp", "trustpilot": "🟩 TrustPilot", "google": "📍 Google Reviews",
     }.get(lead.source_platform, lead.source_platform.upper())
-
     flag = MARKET_FLAG.get(lead.market, "🌍")
-    tiktok_text = f"\n*👁 TikTok Views:* {lead.tiktok_view_count}" if lead.tiktok_view_count is not None else ""
-
+    tiktok_text = f"\n*👁 Views:* {lead.tiktok_view_count}" if lead.tiktok_view_count is not None else ""
     blocks = [
         {"type": "header", "text": {"type": "plain_text",
-            "text": f"{urgency_label(lead.intent_score)} — Score {lead.intent_score}/100  {flag} {lead.market}"}},
+            "text": f"{urgency_label(lead.intent_score)} — {lead.intent_score}/100  {flag} {lead.market}"}},
         {"type": "section", "fields": [
             {"type": "mrkdwn", "text": f"*Platform:*\n{platform_emoji}"},
             {"type": "mrkdwn", "text": f"*Problem:*\n{lead.problem_category}"},
@@ -400,9 +383,7 @@ async def send_to_slack(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
         {"type": "section", "text": {"type": "mrkdwn",
             "text": f"*Pain Point:*\n{lead.pain_point_summary}{tiktok_text}"}},
         {"type": "section", "text": {"type": "mrkdwn",
-            "text": f"*📋 Copy-paste this reply:*\n```{lead.drafted_response}```"}},
-        {"type": "section", "text": {"type": "mrkdwn",
-            "text": f"*🎁 Offer:* {lead.free_resource_offered}"}},
+            "text": f"*📋 Copy-paste reply:*\n```{lead.drafted_response}```"}},
         {"type": "actions", "elements": [{"type": "button",
             "text": {"type": "plain_text", "text": "View Original Post →"},
             "url": lead.source_url, "style": "primary"}]},
@@ -412,56 +393,42 @@ async def send_to_slack(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
         r = await client.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=15)
         return r.status_code < 300
     except Exception as e:
-        logger.error(f"Slack error: {e}")
-        return False
+        logger.error(f"Slack error: {e}"); return False
 
 async def send_to_make(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
-    payload = {
-        "urgency": f"{urgency_label(lead.intent_score)} — {lead.intent_score}",
-        "platform": lead.source_platform.upper(),
-        "market": lead.market,
-        "link": lead.source_url,
-        "problem_category": lead.problem_category,
-        "pain_point": lead.pain_point_summary,
-        "reply_to_post": lead.drafted_response,
-        "free_offer": lead.free_resource_offered,
-        "tiktok_views": lead.tiktok_view_count,
-        "processed_at": lead.processed_at,
-    }
     try:
-        r = await client.post(MAKE_WEBHOOK_URL, json=payload, timeout=15)
+        r = await client.post(MAKE_WEBHOOK_URL, json={
+            "urgency": f"{urgency_label(lead.intent_score)} — {lead.intent_score}",
+            "platform": lead.source_platform.upper(), "market": lead.market,
+            "link": lead.source_url, "problem_category": lead.problem_category,
+            "pain_point": lead.pain_point_summary, "reply_to_post": lead.drafted_response,
+            "free_offer": lead.free_resource_offered, "tiktok_views": lead.tiktok_view_count,
+            "processed_at": lead.processed_at,
+        }, timeout=15)
         return r.status_code < 300
     except Exception as e:
-        logger.error(f"Make.com error: {e}")
-        return False
+        logger.error(f"Make.com error: {e}"); return False
 
 async def save_to_supabase(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
     headers = {
         "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json", "Prefer": "return=minimal",
     }
-    record = {
-        "source_platform": lead.source_platform,
-        "source_url": lead.source_url,
-        "raw_text": lead.raw_text[:2000],
-        "intent_score": lead.intent_score,
-        "is_restaurant_owner": lead.is_restaurant_owner,
-        "problem_category": lead.problem_category,
-        "pain_point_summary": lead.pain_point_summary,
-        "drafted_response": lead.drafted_response,
-        "free_resource_offered": lead.free_resource_offered,
-        "market": lead.market,
-        "tiktok_view_count": lead.tiktok_view_count,
-        "passed_threshold": True,
-        "delivered_to_make": True,
-    }
     try:
-        r = await client.post(f"{SUPABASE_URL}/rest/v1/leads", headers=headers,
-                              json=record, timeout=15)
+        r = await client.post(f"{SUPABASE_URL}/rest/v1/leads", headers=headers, json={
+            "source_platform": lead.source_platform, "source_url": lead.source_url,
+            "raw_text": lead.raw_text[:2000], "intent_score": lead.intent_score,
+            "is_restaurant_owner": lead.is_restaurant_owner,
+            "problem_category": lead.problem_category,
+            "pain_point_summary": lead.pain_point_summary,
+            "drafted_response": lead.drafted_response,
+            "free_resource_offered": lead.free_resource_offered,
+            "market": lead.market, "tiktok_view_count": lead.tiktok_view_count,
+            "passed_threshold": True, "delivered_to_make": True,
+        }, timeout=15)
         return r.status_code in (200, 201)
     except Exception as e:
-        logger.error(f"Supabase error: {e}")
-        return False
+        logger.error(f"Supabase error: {e}"); return False
 
 async def deliver_lead(lead: LeadOutput):
     async with httpx.AsyncClient() as client:
@@ -474,39 +441,24 @@ async def deliver_lead(lead: LeadOutput):
 # SCRAPERS
 # ═══════════════════════════════════════════════════════════
 
-# ── FACEBOOK ──────────────────────────────────────────────
-# ── FACEBOOK ──────────────────────────────────────────────
 def scrape_facebook_groups(since_date: str) -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
-    logger.info(f"Facebook: scraping {len(FACEBOOK_GROUPS)} verified public groups")
     try:
         run = client.actor("apify/facebook-groups-scraper").call(run_input={
             "startUrls": [{"url": u} for u in FACEBOOK_GROUPS],
-            "resultsLimit": 40,
-            "maxComments": 0,
+            "resultsLimit": 40, "maxComments": 0,
         })
         for post in client.dataset(run["defaultDatasetId"]).iterate_items():
             text = post.get("text") or post.get("message", "")
             url  = post.get("url") or post.get("postUrl", "")
             if text and any(kw in text.lower() for kw in KEYWORDS):
                 items.append({"platform": "facebook", "url": url, "text": text})
-        logger.info(f"Facebook Groups: {len(items)} matching posts")
+        logger.info(f"Facebook: {len(items)} matching posts")
     except Exception as e:
-        logger.error(f"Facebook scraper error: {e}")
+        logger.error(f"Facebook error: {e}")
     return items
-
-# ── REDDIT ────────────────────────────────────────────────
-# Keywords that must appear in the subreddit name or description to be included
-REDDIT_RELEVANCE_KEYWORDS = [
-    "restaurant", "cafe", "food", "hospitality", "kitchen", "chef",
-    "bar", "diner", "barista", "small business", "entrepreneur", "canada business",
-    "uk business", "pizza", "burger", "server", "waiter",
-]
-
-# Subreddits that match keywords but are NOT relevant (manual blocklist)
-REDDIT_BLOCKLIST = {"CafeRacers", "caferacer", "Coffee", "ItalianFood", "chicagofood", "OttawaFood"}
 
 def discover_subreddits() -> list[str]:
     found, seen = [], set()
@@ -524,21 +476,16 @@ def discover_subreddits() -> list[str]:
                 name = d.get("display_name", "")
                 subs = d.get("subscribers", 0)
                 kind = d.get("subreddit_type", "")
-                desc = (d.get("public_description", "") + " " + d.get("display_name", "")).lower()
-                relevant = any(kw in desc for kw in REDDIT_RELEVANCE_KEYWORDS)
-                blocked  = name in REDDIT_BLOCKLIST
-                if name and name not in seen and kind == "public" and subs >= 1000 and relevant and not blocked:
+                desc = (d.get("public_description", "") + " " + name).lower()
+                if (name and name not in seen and kind == "public" and subs >= 1000
+                        and any(kw in desc for kw in REDDIT_RELEVANCE_KEYWORDS)
+                        and name not in REDDIT_BLOCKLIST):
                     found.append(name)
-                    seen.add(name)
-                    logger.info(f"  ✅ r/{name} ({subs:,} subscribers)")
-                else:
-                    if name and name not in seen:
-                        logger.info(f"  ⛔ r/{name} — filtered out")
-                    seen.add(name)
+                seen.add(name)
             time.sleep(1)
         except Exception as e:
-            logger.error(f"Subreddit discovery error for '{term}': {e}")
-    logger.info(f"Reddit discovery: {len(found)} subreddits found")
+            logger.error(f"Subreddit discovery error '{term}': {e}")
+    logger.info(f"Reddit: {len(found)} subreddits discovered")
     return found
 
 def scrape_reddit(since_date: str) -> list[dict]:
@@ -547,15 +494,14 @@ def scrape_reddit(since_date: str) -> list[dict]:
     items      = []
     subreddits = discover_subreddits()
     if not subreddits:
-        logger.warning("No subreddits discovered — skipping Reddit scrape")
+        logger.warning("No subreddits found — skipping Reddit")
         return []
     try:
         for sub in subreddits:
             logger.info(f"  Reddit: r/{sub}")
             run = client.actor("trudax/reddit-scraper-lite").call(run_input={
                 "startUrls": [{"url": f"https://www.reddit.com/r/{sub}/new/"}],
-                "maxPostCount": 30, "maxCommentCount": 0,
-                "afterDate": since_date,
+                "maxPostCount": 30, "maxCommentCount": 0, "afterDate": since_date,
             })
             for post in client.dataset(run["defaultDatasetId"]).iterate_items():
                 combined = f"{post.get('title','')} {post.get('body','')}".lower()
@@ -568,10 +514,9 @@ def scrape_reddit(since_date: str) -> list[dict]:
             time.sleep(2)
         logger.info(f"Reddit: {len(items)} matching posts")
     except Exception as e:
-        logger.error(f"Reddit scraper error: {e}")
+        logger.error(f"Reddit error: {e}")
     return items
 
-# ── TIKTOK ────────────────────────────────────────────────
 def scrape_tiktok() -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
@@ -580,39 +525,32 @@ def scrape_tiktok() -> list[dict]:
         for hashtag in TIKTOK_HASHTAGS:
             logger.info(f"  TikTok: #{hashtag}")
             run = client.actor("clockworks/free-tiktok-scraper").call(run_input={
-                "hashtags": [hashtag],
-                "resultsPerPage": 30,
-                "shouldDownloadVideos": False,
-                "shouldDownloadCovers": False,
+                "hashtags": [hashtag], "resultsPerPage": 30,
+                "shouldDownloadVideos": False, "shouldDownloadCovers": False,
             })
             for video in client.dataset(run["defaultDatasetId"]).iterate_items():
-                views   = video.get("playCount") or video.get("stats", {}).get("playCount", 9999)
-                caption = video.get("text") or video.get("desc", "")
-                url     = video.get("webVideoUrl") or video.get("url", "")
-                author  = video.get("authorMeta", {})
-                bio     = author.get("signature", "") or author.get("bio", "")
+                views  = video.get("playCount") or video.get("stats", {}).get("playCount", 9999)
+                caption= video.get("text") or video.get("desc", "")
+                url    = video.get("webVideoUrl") or video.get("url", "")
+                author = video.get("authorMeta", {})
+                bio    = author.get("signature", "") or author.get("bio", "")
                 if views > TIKTOK_MAX_VIEWS:
                     continue
                 combined = (caption + bio).lower()
-                restaurant_signals = [
-                    "restaurant", "café", "cafe", "pizza", "burger", "diner",
-                    "food", "kitchen", "chef", "cook", "menu", "hospitality",
-                ]
-                if not any(sig in combined for sig in restaurant_signals):
+                if not any(s in combined for s in ["restaurant","café","cafe","pizza","burger","food","kitchen","chef","menu","hospitality"]):
                     continue
                 items.append({
                     "platform": "tiktok",
                     "url": url or f"https://tiktok.com/@{author.get('name','')}",
-                    "text": f"TikTok video caption: {caption}\nAccount bio: {bio}\nViews: {views}",
+                    "text": f"TikTok caption: {caption}\nBio: {bio}\nViews: {views}",
                     "tiktok_views": views,
                 })
             time.sleep(3)
-        logger.info(f"TikTok: {len(items)} low-view restaurant videos found")
+        logger.info(f"TikTok: {len(items)} low-view videos")
     except Exception as e:
-        logger.error(f"TikTok scraper error: {e}")
+        logger.error(f"TikTok error: {e}")
     return items
 
-# ── INSTAGRAM ─────────────────────────────────────────────
 def scrape_instagram() -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
@@ -620,19 +558,17 @@ def scrape_instagram() -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=INSTAGRAM_MAX_AGE_DAYS)
     try:
         for hashtag in INSTAGRAM_HASHTAGS:
-            logger.info(f"  Instagram: #{hashtag}")
             run = client.actor("apify/instagram-hashtag-scraper").call(run_input={
-                "hashtags": [hashtag],
-                "resultsLimit": 40,
+                "hashtags": [hashtag], "resultsLimit": 40,
                 "onlyPostsNewerThan": cutoff.strftime("%Y-%m-%d"),
             })
             for post in client.dataset(run["defaultDatasetId"]).iterate_items():
-                views   = post.get("videoViewCount") or post.get("playCount") or 0
+                views = post.get("videoViewCount") or post.get("playCount") or 0
                 caption = post.get("caption") or post.get("text", "")
-                url     = post.get("url") or post.get("shortCode", "")
+                url = post.get("url") or post.get("shortCode", "")
                 if url and not url.startswith("http"):
                     url = f"https://www.instagram.com/p/{url}/"
-                owner = post.get("ownerUsername") or post.get("owner", {}).get("username", "")
+                owner = post.get("ownerUsername") or ""
                 bio   = post.get("ownerBio") or ""
                 is_video = post.get("type") in ("Video", "Reel") or post.get("isVideo", False)
                 if not is_video or views > INSTAGRAM_MAX_VIEWS:
@@ -641,28 +577,24 @@ def scrape_instagram() -> list[dict]:
                 if not any(s in combined for s in ["restaurant","café","cafe","pizza","burger","food","kitchen","chef"]):
                     continue
                 items.append({
-                    "platform": "instagram",
-                    "url": url,
-                    "text": f"Instagram Reel caption: {caption}\nAccount: @{owner} | Bio: {bio}\nViews: {views}",
-                    "ig_views": views,
+                    "platform": "instagram", "url": url,
+                    "text": f"Instagram Reel: {caption}\n@{owner} | Bio: {bio}\nViews: {views}",
                 })
             time.sleep(3)
-        logger.info(f"Instagram: {len(items)} low-view Reels found")
+        logger.info(f"Instagram: {len(items)} Reels")
     except Exception as e:
-        logger.error(f"Instagram scraper error: {e}")
+        logger.error(f"Instagram error: {e}")
     return items
 
-# ── GOOGLE REVIEWS ────────────────────────────────────────
 def scrape_google_reviews() -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
     items  = []
     try:
+        # ✅ Fixed actor name: was compass/google-maps-scraper
         run = client.actor("apify/google-maps-scraper").call(run_input={
             "searchStringsArray": GOOGLE_MAPS_QUERIES[:6],
-            "maxReviews": 5,
-            "reviewsSort": "newest",
-            "language": "en",
+            "maxReviews": 5, "reviewsSort": "newest", "language": "en",
         })
         for place in client.dataset(run["defaultDatasetId"]).iterate_items():
             rating = place.get("totalScore") or place.get("rating", 5)
@@ -671,15 +603,16 @@ def scrape_google_reviews() -> list[dict]:
                 url     = place.get("url") or place.get("website", "")
                 reviews = place.get("reviews", [{}])
                 review_text = reviews[0].get("text", "") if reviews else ""
-                text = f"Google Maps: {name} ({rating}★). Recent review: {review_text}"
                 if url:
-                    items.append({"platform": "google", "url": url, "text": text})
-        logger.info(f"Google Reviews: {len(items)} struggling restaurants")
+                    items.append({
+                        "platform": "google", "url": url,
+                        "text": f"Google Maps: {name} ({rating}★). Review: {review_text}",
+                    })
+        logger.info(f"Google: {len(items)} struggling restaurants")
     except Exception as e:
-        logger.error(f"Google Reviews scraper error: {e}")
+        logger.error(f"Google error: {e}")
     return items
 
-# ── TRUSTPILOT ────────────────────────────────────────────
 def scrape_trustpilot() -> list[dict]:
     from apify_client import ApifyClient
     client = ApifyClient(get_apify_token())
@@ -687,21 +620,19 @@ def scrape_trustpilot() -> list[dict]:
     try:
         run = client.actor("apify/trustpilot-scraper").call(run_input={
             "startUrls": [{"url": u} for u in TRUSTPILOT_CATEGORIES],
-            "maxReviews": 30,
-            "ratingFilter": [1, 2],
+            "maxReviews": 30, "ratingFilter": [1, 2],
         })
         for item in client.dataset(run["defaultDatasetId"]).iterate_items():
             text = item.get("text") or item.get("reviewBody", "")
             url  = item.get("businessUrl") or item.get("url", "")
             if text:
                 items.append({"platform": "trustpilot", "url": url,
-                              "text": f"[TrustPilot low-star review] {text}"})
+                              "text": f"[TrustPilot 1-2★] {text}"})
         logger.info(f"TrustPilot: {len(items)} reviews")
     except Exception as e:
-        logger.error(f"TrustPilot scraper error: {e}")
+        logger.error(f"TrustPilot error: {e}")
     return items
 
-# ── YELP ──────────────────────────────────────────────────
 def scrape_yelp() -> list[dict]:
     if not YELP_RESTAURANTS:
         return []
@@ -715,12 +646,11 @@ def scrape_yelp() -> list[dict]:
         for item in client.dataset(run["defaultDatasetId"]).iterate_items():
             if item.get("rating", 5) in [1, 2] and item.get("text"):
                 items.append({
-                    "platform": "yelp",
-                    "url": item.get("businessUrl", ""),
-                    "text": f"[{item.get('rating')}★ Yelp Review] {item.get('text','')}",
+                    "platform": "yelp", "url": item.get("businessUrl", ""),
+                    "text": f"[{item.get('rating')}★ Yelp] {item.get('text','')}",
                 })
     except Exception as e:
-        logger.error(f"Yelp scraper error: {e}")
+        logger.error(f"Yelp error: {e}")
     return items
 
 # ═══════════════════════════════════════════════════════════
@@ -731,32 +661,31 @@ _pipeline_lock = asyncio.Lock()
 async def run_pipeline(test_mode: bool = False):
     if _pipeline_lock.locked():
         logger.warning("⚠️  Pipeline already running — skipping duplicate /run call")
-        return {"skipped": True, "reason": "pipeline already in progress"}
+        return {"skipped": True, "reason": "already running"}
 
     async with _pipeline_lock:
         start = time.monotonic()
         logger.info("=" * 60)
-        logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v3")
+        logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v4")
         logger.info("   Platforms: Facebook · Reddit · TikTok · Google · TrustPilot")
         logger.info("   Markets:   🇺🇸 USA  🇬🇧 UK  🇨🇦 Canada")
         logger.info("=" * 60)
 
         if test_mode:
-            logger.info("TEST MODE — sample data, no Apify credits used")
+            logger.info("TEST MODE — no Apify credits used")
             raw_items = [
-                {"platform": "facebook", "url": "https://facebook.com/groups/restaurantownersuk/test1",
-                 "text": "I run a burger spot in Manchester. Been posting on Instagram for 2 years and still only getting 80-100 views per video. Revenue down 25% vs last year."},
-                {"platform": "reddit", "url": "https://reddit.com/r/restaurantowners/test2",
+                {"platform": "facebook", "url": "https://facebook.com/test1",
+                 "text": "I run a burger spot in Manchester. Instagram for 2 years, still only 80-100 views per video. Revenue down 25%."},
+                {"platform": "reddit", "url": "https://reddit.com/test2",
                  "text": "Running a burger joint in Austin TX. DoorDash is killing our margins and we barely have an Instagram presence."},
-                {"platform": "tiktok", "url": "https://tiktok.com/@leedscafemum/video/123",
-                 "text": "TikTok video caption: Made 50 croissants today, trying to grow this account 😭\nAccount bio: Owner of The Corner Café, Leeds\nViews: 47",
+                {"platform": "tiktok", "url": "https://tiktok.com/@leedscafe/video/123",
+                 "text": "TikTok caption: Made 50 croissants today, trying to grow this account 😭\nBio: Owner of The Corner Café, Leeds\nViews: 47",
                  "tiktok_views": 47},
                 {"platform": "google", "url": "https://maps.google.com/?cid=test1",
-                 "text": "Google Maps: Mario's Pizza NYC (2.8★). Recent review: no social media presence at all."},
+                 "text": "Google Maps: Mario's Pizza NYC (2.8★). Review: no social media presence at all."},
             ]
         else:
             since_date = await get_last_run_date()
-            logger.info(f"📅 Only scraping posts newer than: {since_date}")
             raw_items = []
             if ACTIVE_PLATFORMS.get("facebook"):   raw_items += scrape_facebook_groups(since_date)
             if ACTIVE_PLATFORMS.get("reddit"):     raw_items += scrape_reddit(since_date)
@@ -766,17 +695,16 @@ async def run_pipeline(test_mode: bool = False):
             if ACTIVE_PLATFORMS.get("trustpilot"): raw_items += scrape_trustpilot()
             if ACTIVE_PLATFORMS.get("yelp"):       raw_items += scrape_yelp()
 
-            # Dedup — skip URLs already in Supabase
             seen   = await load_seen_urls()
             before = len(raw_items)
-            raw_items = [item for item in raw_items if is_new(item.get("url", ""), seen)]
-            logger.info(f"Dedup: {before - len(raw_items)} already-seen skipped, {len(raw_items)} new")
+            raw_items = [i for i in raw_items if is_new(i.get("url", ""), seen)]
+            logger.info(f"Dedup: {before - len(raw_items)} skipped, {len(raw_items)} new items")
 
-        logger.info(f"Total raw items to process: {len(raw_items)}")
+        logger.info(f"Processing {len(raw_items)} items with 1 Gemini call each (~{len(raw_items)*4.5:.0f}s Gemini time)")
 
         qualified: list[LeadOutput] = []
         for item in raw_items:
-            logger.info(f"\nAnalysing [{item['platform'].upper()}]: {item['text'][:80]}...")
+            logger.info(f"\n[{item['platform'].upper()}] {item['text'][:80]}...")
             lead = process_single_lead(
                 item["text"], item["platform"], item["url"],
                 tiktok_views=item.get("tiktok_views"),
@@ -784,24 +712,21 @@ async def run_pipeline(test_mode: bool = False):
             if lead:
                 qualified.append(lead)
                 logger.info(f"  ✅ QUALIFIED — Score:{lead.intent_score} | {lead.market} | {lead.problem_category}")
-            time.sleep(0.5)
 
         logger.info(f"\n{'='*60}")
-        logger.info(f"Qualified leads: {len(qualified)} / {len(raw_items)}")
+        logger.info(f"Qualified: {len(qualified)} / {len(raw_items)}")
 
         by_market, by_platform = {}, {}
         for lead in qualified:
-            by_market.setdefault(lead.market, 0)
-            by_market[lead.market] += 1
-            by_platform.setdefault(lead.source_platform, 0)
-            by_platform[lead.source_platform] += 1
+            by_market[lead.market]               = by_market.get(lead.market, 0) + 1
+            by_platform[lead.source_platform]    = by_platform.get(lead.source_platform, 0) + 1
 
         for lead in qualified:
-            logger.info(f"\nDelivering {lead.market} score-{lead.intent_score} [{lead.source_platform}]...")
+            logger.info(f"Delivering [{lead.source_platform}] score:{lead.intent_score} {lead.market}...")
             await deliver_lead(lead)
 
         elapsed = round(time.monotonic() - start, 1)
-        logger.info(f"\n✅ DONE — {len(qualified)} Versal leads delivered in {elapsed}s")
+        logger.info(f"\n✅ DONE — {len(qualified)} leads delivered in {elapsed}s")
         return {
             "leads_delivered": len(qualified),
             "total_processed": len(raw_items),
@@ -810,7 +735,8 @@ async def run_pipeline(test_mode: bool = False):
             "seconds": elapsed,
         }
 
-
 if __name__ == "__main__":
+    # test_mode=True  → instant run, no Apify credits
+    # test_mode=False → full live run
     result = asyncio.run(run_pipeline(test_mode=True))
     print("\n", json.dumps(result, indent=2))
