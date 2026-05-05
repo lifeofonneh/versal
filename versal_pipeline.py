@@ -5,7 +5,7 @@ Markets:   USA · UK · Canada
 Leads → Slack (copy-paste ready) + Supabase + Make.com
 
 v6 changes vs v5:
-- Gemini upgraded to gemini-2.5-flash (replaces deprecated gemini-2.0-flash)
+- Gemini model: gemini-2.5-flash (stable, no preview suffix)
 - Gemini on Tier 1 Prepay — ALL rate limiting removed
 - ask_gemini() simplified to single try/except, no retry loops
 - run_pipeline() batch pause block removed
@@ -156,7 +156,7 @@ class LeadOutput(BaseModel):
 # GEMINI — gemini-2.5-flash (replaces deprecated 2.0-flash)
 # Tier 1 Prepay — no rate limiting needed
 # ═══════════════════════════════════════════════════════════
-GEMINI_MODEL = "gemini-2.5-flash-preview-05-20"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 def ask_gemini(prompt: str) -> dict:
     try:
