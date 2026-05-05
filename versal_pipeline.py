@@ -162,24 +162,59 @@ class LeadOutput(BaseModel):
 # ═══════════════════════════════════════════════════════════
 # GEMINI AI ENGINE
 # ═══════════════════════════════════════════════════════════
-def ask_gemini(prompt: str) -> dict:
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=900),
-        )
-        text = response.text.strip()
-        if "```" in text:
-            text = text.split("```")[1]
-            if text.startswith("json"): text = text[4:]
-        return json.loads(text.strip())
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return {}
+def ask_gemini(prompt: str, retries: int = 5) -> dict:
+    for attempt in range(retries):
+        try:
+            response = gemini_client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=900),
+            )
+            text = response.text.strip()
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"): text = text[4:]
+            return json.loads(text.strip())
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                # Extract retry delay from error if available, else wait 60s
+                wait = 62
+                try:
+                    import re
+                    match = re.search(r"retryDelay.*?(\d+)s", msg)
+                    if match:
+                        wait = int(match.group(1)) + 2
+                except Exception:
+                    pass
+                logger.warning(f"Gemini rate limit — waiting {wait}s for quota reset (attempt {attempt+1}/{retries})")
+                time.sleep(wait)
+            else:
+                logger.error(f"Gemini error: {e}")
+                return {}
+    logger.error("Gemini failed after all retries")
+    return {}
+
+# Throttle: max 12 Gemini calls per minute (stay under the 15/min free tier limit)
+_gemini_call_times: list = []
+
+def ask_gemini_throttled(prompt: str) -> dict:
+    global _gemini_call_times
+    now = time.monotonic()
+    # Drop calls older than 60 seconds
+    _gemini_call_times = [t for t in _gemini_call_times if now - t < 60]
+    if len(_gemini_call_times) >= 12:
+        # Wait until the oldest call falls outside the 60s window
+        wait = 61 - (now - _gemini_call_times[0])
+        if wait > 0:
+            logger.info(f"Gemini throttle — waiting {wait:.1f}s to stay under free tier limit")
+            time.sleep(wait)
+        _gemini_call_times = [t for t in _gemini_call_times if time.monotonic() - t < 60]
+    _gemini_call_times.append(time.monotonic())
+    return ask_gemini(prompt)
 
 def score_intent(text: str, platform: str) -> dict:
-    return ask_gemini(f"""You are an expert analyst for Versal Digital Solutions,
+    return ask_gemini_throttled(f"""You are an expert analyst for Versal Digital Solutions,
 a done-for-you short-form content agency for restaurants in the USA, UK, and Canada.
 
 Analyse this {platform} post/comment/video. Return ONLY valid JSON.
@@ -195,7 +230,7 @@ Return ONLY: {{"is_restaurant_owner": true/false, "intent_score": 0-100,
 Text: {text[:1200]}""")
 
 def classify_problem(text: str) -> dict:
-    return ask_gemini(f"""UK/USA/Canada restaurant business consultant.
+    return ask_gemini_throttled(f"""UK/USA/Canada restaurant business consultant.
 Classify this restaurant owner's primary problem. Return ONLY valid JSON.
 
 Categories: Social Media/Visibility, Profitability/Margins, Labor/Hiring,
@@ -228,7 +263,7 @@ def draft_response(text: str, category: str, pain_point: str,
         "google":     "empathetic cold outreach email referencing their Google presence",
     }.get(platform, "friendly helpful message")
 
-    return ask_gemini(f"""You represent Versal Digital Solutions.
+    return ask_gemini_throttled(f"""You represent Versal Digital Solutions.
 
 {AGENCY_CONTEXT}
 {market_note}{tiktok_note}
@@ -449,9 +484,8 @@ def scrape_facebook_groups(since_date: str) -> list[dict]:
     try:
         run = client.actor("apify/facebook-groups-scraper").call(run_input={
             "startUrls": [{"url": u} for u in FACEBOOK_GROUPS],
-            "maxPosts": 40,
+            "resultsLimit": 40,
             "maxComments": 0,
-            "onlyPostsNewerThan": since_date,
         })
         for post in client.dataset(run["defaultDatasetId"]).iterate_items():
             text = post.get("text") or post.get("message", "")
@@ -471,6 +505,9 @@ REDDIT_RELEVANCE_KEYWORDS = [
     "uk business", "pizza", "burger", "server", "waiter",
 ]
 
+# Subreddits that match keywords but are NOT relevant (manual blocklist)
+REDDIT_BLOCKLIST = {"CafeRacers", "caferacer", "Coffee", "ItalianFood", "chicagofood", "OttawaFood"}
+
 def discover_subreddits() -> list[str]:
     found, seen = [], set()
     headers = {"User-Agent": "VersalLeadBot/1.0"}
@@ -488,15 +525,16 @@ def discover_subreddits() -> list[str]:
                 subs = d.get("subscribers", 0)
                 kind = d.get("subreddit_type", "")
                 desc = (d.get("public_description", "") + " " + d.get("display_name", "")).lower()
-                # Must be public, 1k+ subs, AND actually relevant to food/restaurant/business
                 relevant = any(kw in desc for kw in REDDIT_RELEVANCE_KEYWORDS)
-                if name and name not in seen and kind == "public" and subs >= 1000 and relevant:
+                blocked  = name in REDDIT_BLOCKLIST
+                if name and name not in seen and kind == "public" and subs >= 1000 and relevant and not blocked:
                     found.append(name)
                     seen.add(name)
                     logger.info(f"  ✅ r/{name} ({subs:,} subscribers)")
                 else:
                     if name and name not in seen:
-                        logger.info(f"  ⛔ r/{name} — not relevant enough, skipping")
+                        logger.info(f"  ⛔ r/{name} — filtered out")
+                    seen.add(name)
             time.sleep(1)
         except Exception as e:
             logger.error(f"Subreddit discovery error for '{term}': {e}")
@@ -620,7 +658,7 @@ def scrape_google_reviews() -> list[dict]:
     client = ApifyClient(get_apify_token())
     items  = []
     try:
-        run = client.actor("compass/google-maps-scraper").call(run_input={
+        run = client.actor("apify/google-maps-scraper").call(run_input={
             "searchStringsArray": GOOGLE_MAPS_QUERIES[:6],
             "maxReviews": 5,
             "reviewsSort": "newest",
