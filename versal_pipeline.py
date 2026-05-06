@@ -220,6 +220,7 @@ class LeadOutput(BaseModel):
     market: str
     tiktok_view_count: Optional[int] = None
     post_age_days: Optional[int] = None
+    _meta: Optional[dict] = None  # bonus fields from Google Places
     processed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     passed_threshold: bool
 
@@ -381,7 +382,8 @@ async def process_single_lead(text: str, platform: str, url: str,
                         threshold: int = 75,
                         tiktok_views: Optional[int] = None,
                         timestamp: Optional[str] = None,
-                        extra_signals: str = "") -> Optional[LeadOutput]:
+                        extra_signals: str = "",
+                        meta: Optional[dict] = None) -> Optional[LeadOutput]:
     age = post_age_days(timestamp) if timestamp else None
 
     # Hard drop before spending a Gemini call
@@ -410,7 +412,7 @@ async def process_single_lead(text: str, platform: str, url: str,
         drafted_response=result.get("drafted_response", ""),
         free_resource_offered=result.get("free_resource_offered", "Free Versal Mini-Audit"),
         market=market, tiktok_view_count=tiktok_views,
-        post_age_days=age, passed_threshold=True,
+        post_age_days=age, passed_threshold=True, _meta=meta,
     )
 
 
@@ -526,33 +528,63 @@ async def send_to_make(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
         logger.error(f"Make.com error: {e}"); return False
 
 async def save_to_supabase(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
+    """
+    Save lead to Supabase immediately after Gemini qualifies it.
+    Only sends fields that definitely exist — no booleans that might be missing columns.
+    On 400, logs the full response body so you can see exactly what's wrong.
+    """
     headers = {
         "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json", "Prefer": "return=minimal",
     }
+    payload = {
+        "source_platform":    lead.source_platform,
+        "source_url":         lead.source_url,
+        "raw_text":           lead.raw_text[:2000],
+        "intent_score":       lead.intent_score,
+        "problem_category":   lead.problem_category,
+        "pain_point_summary": lead.pain_point_summary,
+        "drafted_response":   lead.drafted_response,
+        "market":             lead.market,
+        "processed_at":       lead.processed_at,
+    }
+    # Add optional fields only if they have values — avoids type errors on nullable cols
+    if lead.tiktok_view_count is not None:
+        payload["tiktok_view_count"] = lead.tiktok_view_count
+    if lead.post_age_days is not None:
+        payload["post_age_days"] = lead.post_age_days
+
     try:
-        r = await client.post(f"{SUPABASE_URL}/rest/v1/leads", headers=headers, json={
-            "source_platform": lead.source_platform, "source_url": lead.source_url,
-            "raw_text": lead.raw_text[:2000], "intent_score": lead.intent_score,
-            "is_restaurant_owner": lead.is_restaurant_owner,
-            "problem_category": lead.problem_category,
-            "pain_point_summary": lead.pain_point_summary,
-            "drafted_response": lead.drafted_response,
-            "free_resource_offered": lead.free_resource_offered,
-            "market": lead.market, "tiktok_view_count": lead.tiktok_view_count,
-            "post_age_days": lead.post_age_days,
-            "passed_threshold": True, "delivered_to_make": True,
-        }, timeout=15)
-        return r.status_code in (200, 201)
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/leads",
+            headers=headers, json=payload, timeout=15
+        )
+        if r.status_code not in (200, 201):
+            # Log the full error body so you can diagnose the 400
+            logger.error(f"Supabase 400 detail: {r.text[:500]}")
+            return False
+        return True
     except Exception as e:
         logger.error(f"Supabase error: {e}"); return False
 
 async def deliver_lead(lead: LeadOutput):
+    """
+    Delivery order:
+      1. Supabase FIRST — dashboard updates immediately, even if Slack/Make fail
+      2. Slack + Make run concurrently after
+    """
     async with httpx.AsyncClient() as client:
-        slack = await send_to_slack(client, lead)
-        make  = await send_to_make(client, lead)
-        supa  = await save_to_supabase(client, lead)
-        logger.info(f"  Delivered → Slack:{slack} | Make:{make} | Supabase:{supa}")
+        # Step 1: save to dashboard immediately
+        supa = await save_to_supabase(client, lead)
+        logger.info(f"  Supabase (dashboard): {'✅ saved' if supa else '❌ failed'}")
+
+        # Step 2: notify Slack + Make concurrently (failures don't block anything)
+        slack, make = await asyncio.gather(
+            send_to_slack(client, lead),
+            send_to_make(client, lead),
+            return_exceptions=True,
+        )
+        logger.info(f"  Slack:{slack} | Make:{make}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -847,6 +879,46 @@ def _score_place(place: dict) -> tuple[bool, list[str]]:
     return len(signals) >= 1, signals
 
 
+async def _get_completed_searches() -> set[str]:
+    """Load the set of Google Places searches already completed from Supabase."""
+    try:
+        async with httpx.AsyncClient() as client:
+            headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scrape_checkpoints",
+                headers=headers,
+                params={"select": "search_key", "platform": "eq.google_places", "limit": 1000},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                logger.warning(f"Checkpoint read failed ({r.status_code}) — starting fresh")
+                return set()
+            return {row["search_key"] for row in r.json()}
+    except Exception as e:
+        logger.error(f"Checkpoint load error: {e}")
+        return set()
+
+async def _mark_search_complete(search_key: str):
+    """Record that a Google Places search has been fully scraped."""
+    try:
+        async with httpx.AsyncClient() as client:
+            headers = {
+                "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json", "Prefer": "return=minimal",
+            }
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/scrape_checkpoints",
+                headers=headers,
+                json={
+                    "platform":   "google_places",
+                    "search_key": search_key,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                },
+                timeout=10,
+            )
+    except Exception as e:
+        logger.error(f"Checkpoint save error: {e}")
+
 async def scrape_google_places() -> list[dict]:
     """
     Direct Google Places API (New) scraper — no Apify.
@@ -857,10 +929,26 @@ async def scrape_google_places() -> list[dict]:
     items = []
     seen_place_ids: set[str] = set()
 
+    # Load which searches we've already completed across previous runs
+    completed = await _get_completed_searches()
+    remaining = [s for s in GOOGLE_PLACES_SEARCHES
+                 if f"{s['query']}|{s['location']}" not in completed]
+
+    total     = len(GOOGLE_PLACES_SEARCHES)
+    skipped   = total - len(remaining)
+    logger.info(f"  Google Places: {remaining and len(remaining)}/{total} searches remaining "
+                f"({skipped} already done across previous runs)")
+
+    if not remaining:
+        logger.info("  ✅ All Google Places searches complete — full map coverage achieved!")
+        logger.info("     To rescan from scratch, clear the scrape_checkpoints table in Supabase.")
+        return []
+
     async with httpx.AsyncClient() as session:
-        for search in GOOGLE_PLACES_SEARCHES:
-            query    = search["query"]
-            location = search["location"]
+        for search in remaining:
+            query      = search["query"]
+            location   = search["location"]
+            search_key = f"{query}|{location}"
             logger.info(f"  Google Places: {query} in {location}")
 
             places = await _places_text_search(session, query, location)
@@ -908,6 +996,13 @@ async def scrape_google_places() -> list[dict]:
                     "USA"
                 )
 
+                # Opening hours — is it currently open? When do they close?
+                hours_obj   = place.get("regularOpeningHours", {})
+                hours_today = ""
+                if hours_obj.get("weekdayDescriptions"):
+                    today_idx   = datetime.now(timezone.utc).weekday()  # 0=Mon
+                    hours_today = hours_obj["weekdayDescriptions"][today_idx]
+
                 items.append({
                     "platform": "google",
                     "url": url,
@@ -916,7 +1011,8 @@ async def scrape_google_places() -> list[dict]:
                         f"Location: {address}\n"
                         f"Rating: {rating}★ | Reviews: {place.get('userRatingCount',0)}\n"
                         f"Website: {website or 'NONE — no web presence'}\n"
-                        f"Phone: {phone}\n"
+                        f"Phone: {phone or 'NONE'}\n"
+                        f"Hours today: {hours_today or 'Unknown'}\n"
                         f"About: {summary}\n"
                         f"Recent reviews: {review_text}"
                     ),
@@ -924,14 +1020,26 @@ async def scrape_google_places() -> list[dict]:
                         f"\nSIGNAL: {name} in {location} flagged for: {signal_str}. "
                         f"Market: {market}. "
                         f"{'No website found — zero digital presence. ' if not website else ''}"
+                        f"{'No phone number listed. ' if not phone else ''}"
                         f"This is a cold outreach email opportunity. "
                         f"Reference their specific location and pain points."
                     ),
+                    "_meta": {
+                        "phone":   phone,
+                        "website": website,
+                        "address": address,
+                        "name":    name,
+                        "rating":  rating,
+                        "reviews": place.get("userRatingCount", 0),
+                        "hours_today": hours_today,
+                    },
                     "_market_hint": market,
                 })
                 qualified_this += 1
 
             logger.info(f"    → {len(places)} places checked, {qualified_this} qualified")
+            # Mark this search as done so future runs skip it
+            await _mark_search_complete(search_key)
             await asyncio.sleep(0.3)  # be polite to the API
 
     logger.info(f"Google Places: {len(items)} target restaurants (deduped by place_id)")
@@ -1056,7 +1164,52 @@ async def run_pipeline(test_mode: bool = False):
         n = len(raw_items)
         logger.info(f"Processing {n} items concurrently (semaphore=10, 503-retry enabled)")
 
-        async def _process_item(i: int, item: dict) -> Optional[LeadOutput]:
+        qualified: list[LeadOutput] = []
+
+        BATCH_SAVE_EVERY = 10   # save to Supabase (dashboard) every N qualified leads
+        pending_leads: list[LeadOutput] = []
+
+        async def _flush_to_supabase(leads: list[LeadOutput]):
+            """Bulk-insert a batch of leads in one HTTP call."""
+            if not leads:
+                return
+            headers = {
+                "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json", "Prefer": "return=minimal",
+            }
+            payload = []
+            for lead in leads:
+                row = {
+                    "source_platform":    lead.source_platform,
+                    "source_url":         lead.source_url,
+                    "raw_text":           lead.raw_text[:2000],
+                    "intent_score":       lead.intent_score,
+                    "problem_category":   lead.problem_category,
+                    "pain_point_summary": lead.pain_point_summary,
+                    "drafted_response":   lead.drafted_response,
+                    "market":             lead.market,
+                    "processed_at":       lead.processed_at,
+                }
+                if lead.tiktok_view_count is not None:
+                    row["tiktok_view_count"] = lead.tiktok_view_count
+                if lead.post_age_days is not None:
+                    row["post_age_days"] = lead.post_age_days
+                payload.append(row)
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.post(
+                        f"{SUPABASE_URL}/rest/v1/leads",
+                        headers=headers, json=payload, timeout=20
+                    )
+                    if r.status_code not in (200, 201):
+                        logger.error(f"Supabase batch error: {r.text[:300]}")
+                    else:
+                        logger.info(f"  📊 Dashboard updated — {len(leads)} leads saved")
+            except Exception as e:
+                logger.error(f"Supabase batch error: {e}")
+
+        async def _process_item(i: int, item: dict) -> None:
+            nonlocal pending_leads
             logger.info(f"[{i+1}/{n}][{item['platform'].upper()}] {item['text'][:80]}...")
             lead = await process_single_lead(
                 text=item["text"],
@@ -1069,24 +1222,33 @@ async def run_pipeline(test_mode: bool = False):
             if lead:
                 logger.info(f"  ✅ QUALIFIED — Score:{lead.intent_score} | "
                             f"{lead.market} | {lead.problem_category} | Age:{lead.post_age_days}d")
-            return lead
+                qualified.append(lead)
+                pending_leads.append(lead)
+
+                # Slack + Make fire instantly per lead (non-blocking)
+                asyncio.create_task(asyncio.gather(
+                    send_to_slack(httpx.AsyncClient(), lead),
+                    send_to_make(httpx.AsyncClient(), lead),
+                    return_exceptions=True,
+                ))
+
+                # Flush to Supabase/dashboard every BATCH_SAVE_EVERY leads
+                if len(pending_leads) >= BATCH_SAVE_EVERY:
+                    batch = pending_leads.copy()
+                    pending_leads.clear()
+                    await _flush_to_supabase(batch)
 
         # Run all Gemini calls concurrently — semaphore caps at 10 in-flight at once
-        results = await asyncio.gather(*[_process_item(i, item) for i, item in enumerate(raw_items)])
-        qualified: list[LeadOutput] = [r for r in results if r is not None]
+        await asyncio.gather(*[_process_item(i, item) for i, item in enumerate(raw_items)])
+
+        # Flush any remaining leads that didn't hit the batch threshold
+        if pending_leads:
+            logger.info(f"  Flushing final {len(pending_leads)} leads to dashboard...")
+            await _flush_to_supabase(pending_leads)
 
         logger.info(f"\n{'='*60}")
         logger.info(f"Qualified: {len(qualified)} / {n}")
 
-        by_market, by_platform = {}, {}
-        for lead in qualified:
-            by_market[lead.market]            = by_market.get(lead.market, 0) + 1
-            by_platform[lead.source_platform] = by_platform.get(lead.source_platform, 0) + 1
-
-        for lead in qualified:
-            logger.info(f"Delivering [{lead.source_platform}] score:{lead.intent_score} "
-                        f"{lead.market} age:{lead.post_age_days}d...")
-            await deliver_lead(lead)
 
         elapsed = round(time.monotonic() - start, 1)
         logger.info(f"\n✅ DONE — {len(qualified)} leads delivered in {elapsed}s")
