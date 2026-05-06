@@ -259,33 +259,48 @@ def is_recent(timestamp_str: str, max_days: int = MAX_POST_AGE_DAYS) -> bool:
 # ═══════════════════════════════════════════════════════════
 # GEMINI
 # ═══════════════════════════════════════════════════════════
-def ask_gemini(prompt: str) -> dict:
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=900,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
-        )
-        text = response.text.strip()
-        if "```" in text:
-            parts = text.split("```")
-            text = parts[1].lstrip("json").strip()
-        start = text.find("{")
-        end   = text.rfind("}") + 1
-        if start == -1 or end == 0:
-            logger.error(f"Gemini: no JSON found in response: {text[:200]}")
-            return {}
-        return json.loads(text[start:end])
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
+# Semaphore limits concurrent Gemini calls — prevents 503 storm
+# 10 concurrent = ~600 calls/min, well within Tier 1 limits
+_gemini_semaphore = asyncio.Semaphore(10)
+
+async def ask_gemini(prompt: str) -> dict:
+    """Async Gemini call with semaphore + 503 retry (up to 3 attempts, 2s backoff)."""
+    async with _gemini_semaphore:
+        for attempt in range(3):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        max_output_tokens=900,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                text = response.text.strip()
+                if "```" in text:
+                    parts = text.split("```")
+                    text = parts[1].lstrip("json").strip()
+                start = text.find("{")
+                end   = text.rfind("}") + 1
+                if start == -1 or end == 0:
+                    logger.error(f"Gemini: no JSON found: {text[:200]}")
+                    return {}
+                return json.loads(text[start:end])
+            except Exception as e:
+                msg = str(e)
+                if "503" in msg or "UNAVAILABLE" in msg:
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(f"Gemini 503 — retry {attempt+1}/3 in {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(f"Gemini error: {e}")
+                return {}
+        logger.error("Gemini 503 — exhausted retries, skipping")
         return {}
 
 
-def analyse_lead(text: str, platform: str,
+async def analyse_lead(text: str, platform: str,
                  tiktok_views: Optional[int] = None,
                  age_days: Optional[int] = None,
                  extra_signals: str = "") -> dict:
@@ -317,7 +332,7 @@ def analyse_lead(text: str, platform: str,
     tone = platform_tones.get(platform, "friendly helpful message")
     market_block = "\n".join(f"- If market={k}: {v}" for k, v in market_notes.items())
 
-    return ask_gemini(f"""You are an analyst and copywriter for Versal Digital Solutions.
+    return await ask_gemini(f"""You are an analyst and copywriter for Versal Digital Solutions.
 {AGENCY_CONTEXT}
 
 Analyse this {platform} post/text and return ONLY valid JSON with ALL fields below.
@@ -362,7 +377,7 @@ Text to analyse:
 {text[:1400]}""")
 
 
-def process_single_lead(text: str, platform: str, url: str,
+async def process_single_lead(text: str, platform: str, url: str,
                         threshold: int = 75,
                         tiktok_views: Optional[int] = None,
                         timestamp: Optional[str] = None,
@@ -374,7 +389,7 @@ def process_single_lead(text: str, platform: str, url: str,
         logger.info(f"  ⏭ SKIPPED — post is {age} days old (>{MAX_POST_AGE_DAYS}d cutoff)")
         return None
 
-    result = analyse_lead(text, platform, tiktok_views=tiktok_views,
+    result = await analyse_lead(text, platform, tiktok_views=tiktok_views,
                           age_days=age, extra_signals=extra_signals)
     if not result:
         return None
@@ -1039,12 +1054,11 @@ async def run_pipeline(test_mode: bool = False):
             logger.info(f"Dedup: {before - len(raw_items)} skipped, {len(raw_items)} new")
 
         n = len(raw_items)
-        logger.info(f"Processing {n} items (hard date filter: >{MAX_POST_AGE_DAYS}d dropped before Gemini)")
-        qualified: list[LeadOutput] = []
+        logger.info(f"Processing {n} items concurrently (semaphore=10, 503-retry enabled)")
 
-        for i, item in enumerate(raw_items):
-            logger.info(f"\n[{i+1}/{n}][{item['platform'].upper()}] {item['text'][:80]}...")
-            lead = process_single_lead(
+        async def _process_item(i: int, item: dict) -> Optional[LeadOutput]:
+            logger.info(f"[{i+1}/{n}][{item['platform'].upper()}] {item['text'][:80]}...")
+            lead = await process_single_lead(
                 text=item["text"],
                 platform=item["platform"],
                 url=item["url"],
@@ -1053,9 +1067,13 @@ async def run_pipeline(test_mode: bool = False):
                 extra_signals=item.get("extra_signals", ""),
             )
             if lead:
-                qualified.append(lead)
                 logger.info(f"  ✅ QUALIFIED — Score:{lead.intent_score} | "
                             f"{lead.market} | {lead.problem_category} | Age:{lead.post_age_days}d")
+            return lead
+
+        # Run all Gemini calls concurrently — semaphore caps at 10 in-flight at once
+        results = await asyncio.gather(*[_process_item(i, item) for i, item in enumerate(raw_items)])
+        qualified: list[LeadOutput] = [r for r in results if r is not None]
 
         logger.info(f"\n{'='*60}")
         logger.info(f"Qualified: {len(qualified)} / {n}")
