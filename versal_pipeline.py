@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # CREDENTIALS
 # ═══════════════════════════════════════════════════════════
 def _load_apify_tokens() -> list[str]:
-    tokens = [os.getenv(f"APIFY_TOKEN_{i}") for i in range(1, 8)]
+    tokens = [os.getenv(f"APIFY_TOKEN_{i}") for i in range(1, 11)]
     tokens = [t for t in tokens if t]
     if not tokens:
         raise ValueError("No Apify tokens found. Set APIFY_TOKEN_1 … APIFY_TOKEN_N as env vars.")
@@ -37,12 +37,22 @@ def _load_apify_tokens() -> list[str]:
 
 APIFY_TOKENS = _load_apify_tokens()
 _apify_index = 0
+_exhausted_tokens: set[str] = set()
 
 def get_apify_token() -> str:
+    """Rotate to the next non-exhausted token."""
     global _apify_index
-    tok = APIFY_TOKENS[_apify_index % len(APIFY_TOKENS)]
-    _apify_index += 1
-    return tok
+    for _ in range(len(APIFY_TOKENS)):
+        tok = APIFY_TOKENS[_apify_index % len(APIFY_TOKENS)]
+        _apify_index += 1
+        if tok not in _exhausted_tokens:
+            return tok
+    raise RuntimeError("All Apify tokens exhausted for this month.")
+
+def mark_token_exhausted(tok: str):
+    _exhausted_tokens.add(tok)
+    remaining = len(APIFY_TOKENS) - len(_exhausted_tokens)
+    logger.warning(f"Token exhausted — {remaining}/{len(APIFY_TOKENS)} tokens remaining")
 
 def _require_env(name: str) -> str:
     val = os.getenv(name)
@@ -54,7 +64,8 @@ SUPABASE_URL      = _require_env("SUPABASE_URL")
 SUPABASE_KEY      = _require_env("SUPABASE_KEY")
 MAKE_WEBHOOK_URL  = _require_env("MAKE_WEBHOOK_URL")
 SLACK_WEBHOOK_URL = _require_env("SLACK_WEBHOOK_URL")
-GEMINI_API_KEY    = _require_env("GEMINI_API_KEY")
+GEMINI_API_KEY         = _require_env("GEMINI_API_KEY")
+GOOGLE_PLACES_API_KEY  = _require_env("GOOGLE_PLACES_API_KEY")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -130,13 +141,51 @@ INSTAGRAM_HASHTAGS = [
 ]
 INSTAGRAM_MAX_LIKES = 50      # very low engagement = no marketing help
 
-# Google Maps queries — looking for no-website / low-rated restaurants
-GOOGLE_MAPS_QUERIES = [
-    "pizza restaurant London", "burger restaurant Manchester", "cafe Birmingham",
-    "pizza restaurant Edinburgh", "indian restaurant Leeds",
-    "pizza restaurant New York", "burger restaurant Los Angeles", "cafe Chicago",
-    "cafe Toronto", "pizza restaurant Vancouver", "burger restaurant Calgary",
+# ═══════════════════════════════════════════════════════════
+# GOOGLE PLACES API — direct, no Apify, $0 within free $200 credit
+# Strategy: search by type+city, filter for low rating OR no website
+# Each search returns up to 20 places, we do Next Page tokens for 60 per city
+# ═══════════════════════════════════════════════════════════
+GOOGLE_PLACES_SEARCHES = [
+    # UK cities
+    {"query": "pizza restaurant",    "location": "London, UK"},
+    {"query": "burger restaurant",   "location": "London, UK"},
+    {"query": "cafe restaurant",     "location": "London, UK"},
+    {"query": "indian restaurant",   "location": "London, UK"},
+    {"query": "chinese restaurant",  "location": "London, UK"},
+    {"query": "pizza restaurant",    "location": "Manchester, UK"},
+    {"query": "burger restaurant",   "location": "Manchester, UK"},
+    {"query": "cafe",                "location": "Manchester, UK"},
+    {"query": "restaurant",          "location": "Birmingham, UK"},
+    {"query": "restaurant",          "location": "Leeds, UK"},
+    {"query": "restaurant",          "location": "Bristol, UK"},
+    {"query": "restaurant",          "location": "Edinburgh, UK"},
+    {"query": "restaurant",          "location": "Glasgow, UK"},
+    {"query": "restaurant",          "location": "Liverpool, UK"},
+    {"query": "restaurant",          "location": "Sheffield, UK"},
+    # USA cities
+    {"query": "pizza restaurant",    "location": "New York, NY"},
+    {"query": "burger restaurant",   "location": "New York, NY"},
+    {"query": "cafe",                "location": "New York, NY"},
+    {"query": "restaurant",          "location": "Los Angeles, CA"},
+    {"query": "restaurant",          "location": "Chicago, IL"},
+    {"query": "restaurant",          "location": "Houston, TX"},
+    {"query": "restaurant",          "location": "Phoenix, AZ"},
+    {"query": "restaurant",          "location": "Philadelphia, PA"},
+    {"query": "restaurant",          "location": "San Antonio, TX"},
+    {"query": "restaurant",          "location": "Dallas, TX"},
+    # Canada cities
+    {"query": "pizza restaurant",    "location": "Toronto, Canada"},
+    {"query": "burger restaurant",   "location": "Toronto, Canada"},
+    {"query": "cafe",                "location": "Toronto, Canada"},
+    {"query": "restaurant",          "location": "Vancouver, Canada"},
+    {"query": "restaurant",          "location": "Calgary, Canada"},
+    {"query": "restaurant",          "location": "Edmonton, Canada"},
+    {"query": "restaurant",          "location": "Montreal, Canada"},
+    {"query": "restaurant",          "location": "Ottawa, Canada"},
 ]
+PLACES_MAX_PER_SEARCH  = 20   # Places API returns max 20 per page
+PLACES_MIN_RATING      = 4.2  # flag anything at or below this
 
 TRUSTPILOT_CATEGORIES = [
     "https://uk.trustpilot.com/categories/restaurants_bars",
@@ -496,57 +545,79 @@ async def deliver_lead(lead: LeadOutput):
 # ═══════════════════════════════════════════════════════════
 _apify_limit_hit = False
 
-def _apify_run(client, actor: str, run_input: dict):
-    """Run an Apify actor and return dataset items. Raises on monthly limit."""
+def _apify_run(actor: str, run_input: dict) -> list:
+    """
+    Run an Apify actor, rotating to the next token automatically if one is exhausted.
+    Tries every available non-exhausted token before giving up.
+    """
     global _apify_limit_hit
-    try:
-        run = client.actor(actor).call(run_input=run_input)
-        return list(client.dataset(run["defaultDatasetId"]).iterate_items())
-    except Exception as e:
-        if "Monthly usage hard limit" in str(e):
-            logger.error("Apify monthly limit hit — stopping all scraping")
-            _apify_limit_hit = True
-            return []
-        raise
+
+    available = [t for t in APIFY_TOKENS if t not in _exhausted_tokens]
+    if not available:
+        logger.error("All Apify tokens exhausted")
+        _apify_limit_hit = True
+        return []
+
+    for tok in available:
+        try:
+            logger.info(f"  Apify: using token …{tok[-6:]}")
+            client = ApifyClient(tok)
+            run    = client.actor(actor).call(run_input=run_input)
+            return list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        except Exception as e:
+            msg = str(e)
+            if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
+                mark_token_exhausted(tok)
+                remaining = len(APIFY_TOKENS) - len(_exhausted_tokens)
+                if remaining == 0:
+                    logger.error("All Apify tokens exhausted — stopping scraping")
+                    _apify_limit_hit = True
+                    return []
+                logger.info(f"  Rotating to next token ({remaining} remaining)...")
+                continue
+            else:
+                raise  # non-quota error — let caller handle
+
+    logger.error("All token rotation attempts failed")
+    _apify_limit_hit = True
+    return []
 
 
 def scrape_facebook_groups(since_date: str) -> list[dict]:
+    """
+    ONE actor run for ALL groups — single container startup = fraction of the cost.
+    resultsLimit applies across all groups combined.
+    """
     global _apify_limit_hit
     if _apify_limit_hit: return []
-    from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())
-    items  = []
-    for group_url in FACEBOOK_GROUPS:
-        if _apify_limit_hit: break
-        logger.info(f"  Facebook: {group_url}")
-        try:
-            posts = _apify_run(client, "apify/facebook-groups-scraper", {
-                "startUrls": [{"url": group_url}],
-                "resultsLimit": 40, "maxComments": 0,
-            })
-        except Exception as e:
-            logger.error(f"Facebook error ({group_url}): {e}"); continue
-        for post in posts:
-            text      = post.get("text") or post.get("message", "")
-            url       = post.get("url") or post.get("postUrl", "")
-            timestamp = post.get("time") or post.get("timestamp") or post.get("date", "")
-            if not text or not any(kw in text.lower() for kw in KEYWORDS):
-                continue
-            if not is_recent(timestamp):
-                logger.info(f"  ⏭ Facebook post too old: {timestamp}")
-                continue
-            items.append({"platform": "facebook", "url": url, "text": text,
-                          "timestamp": timestamp})
-        time.sleep(2)
+    items = []
+    logger.info(f"  Facebook: {len(FACEBOOK_GROUPS)} groups in one run")
+    try:
+        posts = _apify_run("apify/facebook-groups-scraper", {
+            "startUrls": [{"url": u} for u in FACEBOOK_GROUPS],
+            "resultsLimit": 50,
+            "maxComments": 0,
+        })
+    except Exception as e:
+        logger.error(f"Facebook error: {e}")
+        return []
+    for post in posts:
+        text      = post.get("text") or post.get("message", "")
+        url       = post.get("url") or post.get("postUrl", "")
+        timestamp = post.get("time") or post.get("timestamp") or post.get("date", "")
+        if not text or not any(kw in text.lower() for kw in KEYWORDS):
+            continue
+        if not is_recent(timestamp):
+            logger.info(f"  ⏭ Facebook post too old: {timestamp}")
+            continue
+        items.append({"platform": "facebook", "url": url, "text": text,
+                      "timestamp": timestamp})
     logger.info(f"Facebook: {len(items)} matching posts")
     return items
-
 
 def scrape_reddit(since_date: str) -> list[dict]:
     global _apify_limit_hit
     if _apify_limit_hit: return []
-    from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())
     items  = []
     # Use the curated subreddit list directly — no discovery needed
     for sub in REDDIT_SUBREDDITS:
@@ -554,7 +625,7 @@ def scrape_reddit(since_date: str) -> list[dict]:
         if sub in REDDIT_BLOCKLIST: continue
         logger.info(f"  Reddit: r/{sub}")
         try:
-            posts = _apify_run(client, "trudax/reddit-scraper-lite", {
+            posts = _apify_run("trudax/reddit-scraper-lite", {
                 "startUrls": [{"url": f"https://www.reddit.com/r/{sub}/new/"}],
                 "maxPostCount": 30, "maxCommentCount": 0, "afterDate": since_date,
             })
@@ -581,14 +652,12 @@ def scrape_reddit(since_date: str) -> list[dict]:
 def scrape_tiktok() -> list[dict]:
     global _apify_limit_hit
     if _apify_limit_hit: return []
-    from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())
     items  = []
     for hashtag in TIKTOK_HASHTAGS:
         if _apify_limit_hit: break
         logger.info(f"  TikTok: #{hashtag}")
         try:
-            videos = _apify_run(client, "clockworks/free-tiktok-scraper", {
+            videos = _apify_run("clockworks/free-tiktok-scraper", {
                 "hashtags": [hashtag], "resultsPerPage": 30,
                 "shouldDownloadVideos": False, "shouldDownloadCovers": False,
             })
@@ -633,14 +702,12 @@ def scrape_instagram() -> list[dict]:
     """
     global _apify_limit_hit
     if _apify_limit_hit: return []
-    from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())
     items  = []
     for hashtag in INSTAGRAM_HASHTAGS:
         if _apify_limit_hit: break
         logger.info(f"  Instagram: #{hashtag}")
         try:
-            posts = _apify_run(client, "apify/instagram-hashtag-scraper", {
+            posts = _apify_run("apify/instagram-hashtag-scraper", {
                 "hashtags": [hashtag], "resultsLimit": 30,
             })
         except Exception as e:
@@ -684,78 +751,184 @@ def scrape_instagram() -> list[dict]:
     return items
 
 
-def scrape_google_maps() -> list[dict]:
+async def _places_text_search(session: httpx.AsyncClient, query: str, location: str) -> list[dict]:
     """
-    Find restaurants that are:
-    - Rated 4.0 or below (struggling with reputation)
-    - OR have no website (no digital presence = no marketing)
-    Both are warm signals for social media outreach.
+    Google Places API (New) Text Search.
+    Returns up to 20 places per call. We pull 3 pages = 60 per search term.
+    Cost: ~$0.017 per call → full run of 37 searches × 3 pages = ~$1.89 total.
     """
-    global _apify_limit_hit
-    if _apify_limit_hit: return []
-    from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())
-    items  = []
-    try:
-        places = _apify_run(client, "apify/google-maps-scraper", {
-            "searchStringsArray": GOOGLE_MAPS_QUERIES,
-            "maxReviews": 3, "reviewsSort": "newest", "language": "en",
-            "maxCrawledPlacesPerSearch": 20,
-        })
-    except Exception as e:
-        logger.error(f"Google Maps error: {e}"); return []
+    url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": (
+            "places.id,places.displayName,places.rating,places.userRatingCount,"
+            "places.websiteUri,places.nationalPhoneNumber,places.formattedAddress,"
+            "places.googleMapsUri,places.regularOpeningHours,places.reviews,"
+            "places.editorialSummary,places.priceLevel,places.businessStatus,"
+            "nextPageToken"
+        ),
+    }
+    all_places = []
+    page_token = None
 
-    for place in places:
-        rating  = place.get("totalScore") or place.get("rating")
-        website = place.get("website") or place.get("url", "")
-        name    = place.get("title", "")
-        gmaps_url = place.get("url") or place.get("link", "")
-        reviews = place.get("reviews", [])
-        review_text = " | ".join(r.get("text","") for r in reviews[:2] if r.get("text"))
-        opening_date = place.get("openedOn") or place.get("permanentlyClosed")
+    for page in range(3):   # 3 pages = up to 60 places per search
+        body = {
+            "textQuery": f"{query} in {location}",
+            "maxResultCount": 20,
+            "languageCode": "en",
+        }
+        if page_token:
+            body["pageToken"] = page_token
 
-        # Signal 1: low rated
-        low_rated = rating and float(rating) <= 4.0
-        # Signal 2: no website (no digital footprint)
-        no_website = not website or website == ""
-        # Signal 3: newly opened (hungry for customers)
-        new_business = bool(opening_date) and "2024" in str(opening_date) or "2025" in str(opening_date)
+        try:
+            r = await session.post(url, headers=headers, json=body, timeout=15)
+            data = r.json()
+            if r.status_code != 200:
+                logger.error(f"Places API error {r.status_code}: {data.get('error',{}).get('message',data)}")
+                break
+            places = data.get("places", [])
+            all_places.extend(places)
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+            await asyncio.sleep(0.5)  # brief pause between pages
+        except Exception as e:
+            logger.error(f"Places API request error: {e}")
+            break
 
-        if not (low_rated or no_website or new_business):
-            continue
-        if not gmaps_url and not website:
-            continue
+    return all_places
 
-        signals = []
-        if low_rated:    signals.append(f"{rating}★ rating")
-        if no_website:   signals.append("no website found")
-        if new_business: signals.append("recently opened")
 
-        url = website or gmaps_url
-        items.append({
-            "platform": "google",
-            "url": url,
-            "text": (f"Google Maps: {name} ({rating or 'no rating'}★). "
-                     f"Signals: {', '.join(signals)}. "
-                     f"Recent reviews: {review_text[:400]}"),
-            "extra_signals": (
-                f"\nSIGNAL: Restaurant found via Google Maps with these flags: "
-                f"{', '.join(signals)}. This is a cold outreach opportunity — "
-                "craft an email-style response."
-            ),
-        })
-    logger.info(f"Google Maps: {len(items)} target restaurants")
+def _score_place(place: dict) -> tuple[bool, list[str]]:
+    """
+    Score a place and return (qualifies, signals[]).
+    A place qualifies if it hits ANY of our lead signals.
+    """
+    rating       = place.get("rating")
+    review_count = place.get("userRatingCount", 0)
+    website      = place.get("websiteUri", "")
+    status       = place.get("businessStatus", "OPERATIONAL")
+    price_level  = place.get("priceLevel", "")
+
+    signals = []
+
+    # Signal 1: low rating (struggling reputation = pain point)
+    if rating and float(rating) <= PLACES_MIN_RATING:
+        signals.append(f"{rating}★ rating ({review_count} reviews)")
+
+    # Signal 2: no website (zero digital presence)
+    if not website:
+        signals.append("no website")
+
+    # Signal 3: very few reviews (new or invisible business)
+    if review_count and int(review_count) < 30:
+        signals.append(f"only {review_count} reviews — low visibility")
+
+    # Signal 4: budget/cheap restaurant (thin margins, needs volume)
+    if price_level in ("PRICE_LEVEL_INEXPENSIVE", "PRICE_LEVEL_MODERATE"):
+        signals.append("budget segment — needs volume")
+
+    return len(signals) >= 1, signals
+
+
+async def scrape_google_places() -> list[dict]:
+    """
+    Direct Google Places API (New) scraper — no Apify.
+    Searches 37 city+type combos × up to 60 places = up to 2,220 restaurants checked.
+    Filters for low rating, no website, or low review count.
+    Cost per full run: ~$2-4 out of $200 monthly free credit.
+    """
+    items = []
+    seen_place_ids: set[str] = set()
+
+    async with httpx.AsyncClient() as session:
+        for search in GOOGLE_PLACES_SEARCHES:
+            query    = search["query"]
+            location = search["location"]
+            logger.info(f"  Google Places: {query} in {location}")
+
+            places = await _places_text_search(session, query, location)
+            qualified_this = 0
+
+            for place in places:
+                place_id = place.get("id", "")
+                if place_id in seen_place_ids:
+                    continue
+                seen_place_ids.add(place_id)
+
+                qualifies, signals = _score_place(place)
+                if not qualifies:
+                    continue
+
+                name    = place.get("displayName", {}).get("text", "Unknown")
+                rating  = place.get("rating", "N/A")
+                website = place.get("websiteUri", "")
+                phone   = place.get("nationalPhoneNumber", "")
+                address = place.get("formattedAddress", "")
+                gmaps   = place.get("googleMapsUri", "")
+                summary = place.get("editorialSummary", {}).get("text", "")
+
+                # Pull top 2 recent reviews for context
+                reviews = place.get("reviews", [])
+                review_snippets = []
+                for r in reviews[:2]:
+                    txt = r.get("text", {}).get("text", "")
+                    if txt:
+                        review_snippets.append(txt[:200])
+                review_text = " | ".join(review_snippets)
+
+                # Build the URL — prefer website, fall back to Google Maps link
+                url = website or gmaps
+                if not url:
+                    continue
+
+                signal_str = ", ".join(signals)
+                market = (
+                    "UK"     if any(c in location for c in ["UK", "London", "Manchester", "Birmingham",
+                                                             "Leeds", "Bristol", "Edinburgh", "Glasgow",
+                                                             "Liverpool", "Sheffield"]) else
+                    "Canada" if any(c in location for c in ["Canada", "Toronto", "Vancouver",
+                                                             "Calgary", "Edmonton", "Montreal", "Ottawa"]) else
+                    "USA"
+                )
+
+                items.append({
+                    "platform": "google",
+                    "url": url,
+                    "text": (
+                        f"Restaurant: {name}\n"
+                        f"Location: {address}\n"
+                        f"Rating: {rating}★ | Reviews: {place.get('userRatingCount',0)}\n"
+                        f"Website: {website or 'NONE — no web presence'}\n"
+                        f"Phone: {phone}\n"
+                        f"About: {summary}\n"
+                        f"Recent reviews: {review_text}"
+                    ),
+                    "extra_signals": (
+                        f"\nSIGNAL: {name} in {location} flagged for: {signal_str}. "
+                        f"Market: {market}. "
+                        f"{'No website found — zero digital presence. ' if not website else ''}"
+                        f"This is a cold outreach email opportunity. "
+                        f"Reference their specific location and pain points."
+                    ),
+                    "_market_hint": market,
+                })
+                qualified_this += 1
+
+            logger.info(f"    → {len(places)} places checked, {qualified_this} qualified")
+            await asyncio.sleep(0.3)  # be polite to the API
+
+    logger.info(f"Google Places: {len(items)} target restaurants (deduped by place_id)")
     return items
 
 
 def scrape_trustpilot() -> list[dict]:
     global _apify_limit_hit
     if _apify_limit_hit: return []
-    from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())
     items  = []
     try:
-        results = _apify_run(client, "apify/trustpilot-scraper", {
+        results = _apify_run("apify/trustpilot-scraper", {
             "startUrls": [{"url": u} for u in TRUSTPILOT_CATEGORIES],
             "maxReviews": 30, "ratingFilter": [1, 2],
         })
@@ -774,11 +947,9 @@ def scrape_trustpilot() -> list[dict]:
 def scrape_yelp() -> list[dict]:
     global _apify_limit_hit
     if _apify_limit_hit or not YELP_RESTAURANTS: return []
-    from apify_client import ApifyClient
-    client = ApifyClient(get_apify_token())
     items  = []
     try:
-        results = _apify_run(client, "apify/yelp-scraper", {
+        results = _apify_run("apify/yelp-scraper", {
             "startUrls": [{"url": u} for u in YELP_RESTAURANTS], "maxReviews": 10,
         })
     except Exception as e:
@@ -798,8 +969,9 @@ def scrape_yelp() -> list[dict]:
 _pipeline_lock = asyncio.Lock()
 
 async def run_pipeline(test_mode: bool = False):
-    global _apify_limit_hit
+    global _apify_limit_hit, _exhausted_tokens
     _apify_limit_hit = False
+    _exhausted_tokens = set()  # reset per run — monthly limits reset on different dates
 
     if _pipeline_lock.locked():
         logger.warning("⚠️  Pipeline already running — skipping duplicate call")
@@ -854,7 +1026,7 @@ async def run_pipeline(test_mode: bool = False):
             if ACTIVE_PLATFORMS.get("reddit"):     raw_items += scrape_reddit(since_date)
             if ACTIVE_PLATFORMS.get("tiktok"):     raw_items += scrape_tiktok()
             if ACTIVE_PLATFORMS.get("instagram"):  raw_items += scrape_instagram()
-            if ACTIVE_PLATFORMS.get("google"):     raw_items += scrape_google_maps()
+            if ACTIVE_PLATFORMS.get("google"):     raw_items += await scrape_google_places()
             if ACTIVE_PLATFORMS.get("trustpilot"): raw_items += scrape_trustpilot()
             if ACTIVE_PLATFORMS.get("yelp"):       raw_items += scrape_yelp()
 
