@@ -16,6 +16,7 @@ v7 changes vs v6:
 """
 
 import asyncio, json, httpx, os, time, logging
+from apify_client import ApifyClient
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from pydantic import BaseModel, Field
