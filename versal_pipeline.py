@@ -148,12 +148,13 @@ INSTAGRAM_MAX_LIKES = 50      # very low engagement = no marketing help
 # Each search returns up to 20 places, we do Next Page tokens for 60 per city
 # ═══════════════════════════════════════════════════════════
 GOOGLE_PLACES_SEARCHES = [
-    # UK cities
+    # UK — expanded
     {"query": "pizza restaurant",    "location": "London, UK"},
     {"query": "burger restaurant",   "location": "London, UK"},
-    {"query": "cafe restaurant",     "location": "London, UK"},
+    {"query": "cafe",                "location": "London, UK"},
     {"query": "indian restaurant",   "location": "London, UK"},
     {"query": "chinese restaurant",  "location": "London, UK"},
+    {"query": "kebab restaurant",    "location": "London, UK"},
     {"query": "pizza restaurant",    "location": "Manchester, UK"},
     {"query": "burger restaurant",   "location": "Manchester, UK"},
     {"query": "cafe",                "location": "Manchester, UK"},
@@ -164,7 +165,15 @@ GOOGLE_PLACES_SEARCHES = [
     {"query": "restaurant",          "location": "Glasgow, UK"},
     {"query": "restaurant",          "location": "Liverpool, UK"},
     {"query": "restaurant",          "location": "Sheffield, UK"},
-    # USA cities
+    {"query": "restaurant",          "location": "Newcastle, UK"},
+    {"query": "restaurant",          "location": "Nottingham, UK"},
+    {"query": "restaurant",          "location": "Leicester, UK"},
+    {"query": "restaurant",          "location": "Cardiff, UK"},
+    {"query": "cafe",                "location": "Brighton, UK"},
+    {"query": "restaurant",          "location": "Plymouth, UK"},
+    {"query": "restaurant",          "location": "Southampton, UK"},
+    {"query": "restaurant",          "location": "Portsmouth, UK"},
+    # USA — expanded
     {"query": "pizza restaurant",    "location": "New York, NY"},
     {"query": "burger restaurant",   "location": "New York, NY"},
     {"query": "cafe",                "location": "New York, NY"},
@@ -175,7 +184,12 @@ GOOGLE_PLACES_SEARCHES = [
     {"query": "restaurant",          "location": "Philadelphia, PA"},
     {"query": "restaurant",          "location": "San Antonio, TX"},
     {"query": "restaurant",          "location": "Dallas, TX"},
-    # Canada cities
+    {"query": "restaurant",          "location": "Miami, FL"},
+    {"query": "restaurant",          "location": "Atlanta, GA"},
+    {"query": "restaurant",          "location": "Seattle, WA"},
+    {"query": "restaurant",          "location": "Denver, CO"},
+    {"query": "cafe",                "location": "Austin, TX"},
+    # Canada — expanded
     {"query": "pizza restaurant",    "location": "Toronto, Canada"},
     {"query": "burger restaurant",   "location": "Toronto, Canada"},
     {"query": "cafe",                "location": "Toronto, Canada"},
@@ -184,6 +198,8 @@ GOOGLE_PLACES_SEARCHES = [
     {"query": "restaurant",          "location": "Edmonton, Canada"},
     {"query": "restaurant",          "location": "Montreal, Canada"},
     {"query": "restaurant",          "location": "Ottawa, Canada"},
+    {"query": "restaurant",          "location": "Winnipeg, Canada"},
+    {"query": "cafe",                "location": "Halifax, Canada"},
 ]
 PLACES_MAX_PER_SEARCH  = 20   # Places API returns max 20 per page
 PLACES_MIN_RATING      = 3.9  # flag anything strictly under 4.0
@@ -1009,8 +1025,9 @@ def _score_place(place: dict) -> tuple[bool, list[str]]:
         if review_count < PLACES_MIN_REVIEWS_FOR_RATING:
             signals.append(f"{rating}★ rating ({review_count} reviews)")
 
-    # Signal 2: no website (zero digital presence)
-    if not website:
+    # Signal 2: no website (zero digital presence) — only if also low reviews
+    # High-rated places with no website are often intentionally offline (fine dining etc)
+    if not website and review_count < 200:
         signals.append("no website")
 
     # Signal 3: very few reviews (new or invisible business)
@@ -1307,7 +1324,7 @@ async def run_pipeline(test_mode: bool = False):
             seen      = await load_seen_urls()
             before    = len(raw_items)
             raw_items = [i for i in raw_items if is_new(i.get("url", ""), seen)]
-            logger.info(f"Dedup: {before - len(raw_items)} skipped, {len(raw_items)} new")
+            logger.info(f"Dedup: {before - len(raw_items)} skipped, {len(raw_items)} new (including {before - len(deduped) + len(raw_items) - len(deduped)} intra-run dupes)")
 
         n = len(raw_items)
         logger.info(f"Processing {n} items concurrently (semaphore=10, 503-retry enabled)")
