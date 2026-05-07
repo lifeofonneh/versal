@@ -197,11 +197,11 @@ TRUSTPILOT_CATEGORIES = [
 YELP_RESTAURANTS: list[str] = []
 
 ACTIVE_PLATFORMS = {
-    "facebook":   True,
-    "reddit":     True,
-    "tiktok":     True,
-    "instagram":  True,
-    "google":     True,
+    "facebook":   False,
+    "reddit":     False,
+    "tiktok":     False,
+    "instagram":  False,
+    "google":     True,   # ← only this runs for now
     "trustpilot": False,
     "yelp":       False,
 }
@@ -717,7 +717,7 @@ _apify_limit_hit = False
 def _apify_run(actor: str, run_input: dict) -> list:
     """
     Run an Apify actor, rotating to the next token automatically if one is exhausted.
-    Tries every available non-exhausted token before giving up.
+    Skips already-exhausted tokens immediately without burning a run attempt.
     """
     global _apify_limit_hit
 
@@ -731,11 +731,31 @@ def _apify_run(actor: str, run_input: dict) -> list:
         try:
             logger.info(f"  Apify: using token …{tok[-6:]}")
             client = ApifyClient(tok)
+
+            # ── Pre-flight: check remaining balance before burning a run ──
+            try:
+                user = client.user().get()
+                plan = user.get("plan", {})
+                usage = plan.get("monthlyUsage", {})
+                limit = plan.get("monthlyLimit", {})
+                used  = usage.get("ACTOR_COMPUTE_UNITS", 0)
+                cap   = limit.get("ACTOR_COMPUTE_UNITS", 999)
+                pct   = (used / cap * 100) if cap else 100
+                if pct >= 99:
+                    logger.warning(f"  Token …{tok[-6:]} at {pct:.0f}% usage — marking exhausted")
+                    mark_token_exhausted(tok)
+                    continue
+                logger.info(f"  Token …{tok[-6:]} usage: {pct:.0f}% ({used}/{cap} CUs)")
+            except Exception:
+                pass  # can't check balance — try anyway
+
             run    = client.actor(actor).call(run_input=run_input)
             return list(client.dataset(run["defaultDatasetId"]).iterate_items())
+
         except Exception as e:
             msg = str(e)
-            if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg:
+            if "Monthly usage hard limit" in msg or "hard limit exceeded" in msg or \
+               "Maximum cost per run" in msg or "lower then actor start cost" in msg:
                 mark_token_exhausted(tok)
                 remaining = len(APIFY_TOKENS) - len(_exhausted_tokens)
                 if remaining == 0:
@@ -745,7 +765,8 @@ def _apify_run(actor: str, run_input: dict) -> list:
                 logger.info(f"  Rotating to next token ({remaining} remaining)...")
                 continue
             else:
-                raise  # non-quota error — let caller handle
+                logger.error(f"  Apify non-quota error on …{tok[-6:]}: {e}")
+                raise
 
     logger.error("All token rotation attempts failed")
     _apify_limit_hit = True
@@ -794,11 +815,9 @@ def scrape_reddit(since_date: str) -> list[dict]:
         if sub in REDDIT_BLOCKLIST: continue
         logger.info(f"  Reddit: r/{sub}")
         try:
-            posts = _apify_run("trudax/reddit-scraper-lite", {
+            posts = _apify_run("odemuno/reddit-scraper", {
                 "startUrls": [{"url": f"https://www.reddit.com/r/{sub}/new/"}],
-                "maxPostCount": 15,     # lowered — free tier caps around here anyway
-                "maxCommentCount": 0,
-                "afterDate": since_date,
+                "maxItems": 15,
                 "includeComments": False,
             })
         except Exception as e:
@@ -1381,6 +1400,12 @@ async def run_pipeline(test_mode: bool = False):
         logger.info(f"\n{'='*60}")
         logger.info(f"Qualified: {len(qualified)} / {n}")
 
+
+        by_market   = {}
+        by_platform = {}
+        for lead in qualified:
+            by_market[lead.market]             = by_market.get(lead.market, 0) + 1
+            by_platform[lead.source_platform]  = by_platform.get(lead.source_platform, 0) + 1
 
         elapsed = round(time.monotonic() - start, 1)
         logger.info(f"\n✅ DONE — {len(qualified)} leads delivered in {elapsed}s")
