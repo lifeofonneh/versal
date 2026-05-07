@@ -186,7 +186,8 @@ GOOGLE_PLACES_SEARCHES = [
     {"query": "restaurant",          "location": "Ottawa, Canada"},
 ]
 PLACES_MAX_PER_SEARCH  = 20   # Places API returns max 20 per page
-PLACES_MIN_RATING      = 4.2  # flag anything at or below this
+PLACES_MIN_RATING      = 3.9  # flag anything strictly under 4.0
+PLACES_MIN_REVIEWS_FOR_RATING = 500  # ignore rating signal if they have 500+ reviews (established business)
 
 TRUSTPILOT_CATEGORIES = [
     "https://uk.trustpilot.com/categories/restaurants_bars",
@@ -418,6 +419,119 @@ async def process_single_lead(text: str, platform: str, url: str,
 
 
 # ═══════════════════════════════════════════════════════════
+# SCHEMA BOOTSTRAP — runs once at startup
+# Ensures every required column exists; adds missing ones automatically.
+# ═══════════════════════════════════════════════════════════
+REQUIRED_COLUMNS = {
+    "source_platform":    "text",
+    "source_url":         "text",
+    "raw_text":           "text",
+    "intent_score":       "integer",
+    "problem_category":   "text",
+    "pain_point_summary": "text",
+    "drafted_response":   "text",
+    "market":             "text",
+    "processed_at":       "timestamptz",
+    "tiktok_view_count":  "integer",
+    "post_age_days":      "integer",
+}
+
+async def ensure_schema():
+    """
+    Check which columns exist in the 'leads' table and ALTER TABLE
+    to add any that are missing. Safe to run on every startup.
+    """
+    async with httpx.AsyncClient() as client:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        # 1. Ask Postgres which columns already exist
+        check_sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name   = 'leads';
+        """
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/exec_sql",
+            headers=headers,
+            json={"query": check_sql},
+            timeout=15,
+        )
+
+        # Supabase exposes raw SQL via the pg_meta endpoint instead
+        # Fall back to querying information_schema via PostgREST
+        r2 = await client.get(
+            f"{SUPABASE_URL}/rest/v1/leads",
+            headers={**headers, "Prefer": "return=representation"},
+            params={"limit": 0},   # fetch 0 rows — just headers
+            timeout=15,
+        )
+
+        # Parse existing columns from the Content-Range / response headers
+        # Simpler: do a dummy SELECT and read the JSON keys if any rows exist,
+        # OR use the Supabase Management API column introspection.
+        # Most reliable zero-dependency approach: SELECT via PostgREST introspection.
+        intr = await client.get(
+            f"{SUPABASE_URL}/rest/v1/leads?limit=1",
+            headers=headers,
+            timeout=15,
+        )
+        existing: set[str] = set()
+        if intr.status_code == 200:
+            rows = intr.json()
+            if rows:
+                existing = set(rows[0].keys())
+            else:
+                # Table exists but empty — get columns via information_schema
+                schema_r = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/rpc/get_lead_columns",
+                    headers=headers, timeout=10,
+                )
+                # If that RPC doesn't exist, fall through to ALTER blindly
+        
+        missing = {col: typ for col, typ in REQUIRED_COLUMNS.items()
+                   if col not in existing}
+
+        if not missing:
+            logger.info("✅ Schema OK — all columns present")
+            return
+
+        logger.warning(f"⚠️  Missing columns detected: {list(missing.keys())} — adding now...")
+
+        for col, typ in missing.items():
+            alter_sql = f'ALTER TABLE public.leads ADD COLUMN IF NOT EXISTS "{col}" {typ};'
+            # Execute via Supabase SQL editor API (requires service role key)
+            ar = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/exec_sql",
+                headers=headers,
+                json={"sql": alter_sql},
+                timeout=15,
+            )
+            if ar.status_code in (200, 204):
+                logger.info(f"  ✅ Added column: {col} ({typ})")
+            else:
+                logger.error(f"  ❌ Failed to add {col}: [{ar.status_code}] {ar.text[:300]}")
+
+        logger.info("Schema bootstrap complete.")
+
+
+async def ensure_schema_safe():
+    """
+    Wrapper — schema errors must never crash the pipeline.
+    If ALTER TABLE fails (e.g. no service role), we log and continue.
+    The _flush_to_supabase fallback will still save what it can.
+    """
+    try:
+        await ensure_schema()
+    except Exception as e:
+        logger.warning(f"Schema bootstrap skipped (non-fatal): {type(e).__name__}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════
 # DEDUP
 # ═══════════════════════════════════════════════════════════
 async def load_seen_urls() -> set[str]:
@@ -504,15 +618,19 @@ async def send_to_slack(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
         {"type": "section", "text": {"type": "mrkdwn",
             "text": f"*📋 Copy-paste reply:*\n```{lead.drafted_response}```"}},
         {"type": "actions", "elements": [{"type": "button",
-            "text": {"type": "plain_text", "text": "View Original Post →"},
+            "text": {"type": "plain_text",
+                     "text": "View on Google Maps →" if lead.source_platform == "google" else "View Original Post →"},
             "url": lead.source_url, "style": "primary"}]},
         {"type": "divider"},
     ]
     try:
         r = await client.post(SLACK_WEBHOOK_URL, json={"blocks": blocks}, timeout=15)
-        return r.status_code < 300
+        if r.status_code >= 300:
+            logger.error(f"Slack error [{r.status_code}]: {r.text[:300]}")
+            return False
+        return True
     except Exception as e:
-        logger.error(f"Slack error: {e}"); return False
+        logger.error(f"Slack error: {type(e).__name__}: {e}"); return False
 
 async def send_to_make(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
     try:
@@ -524,9 +642,12 @@ async def send_to_make(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
             "free_offer": lead.free_resource_offered, "tiktok_views": lead.tiktok_view_count,
             "post_age_days": lead.post_age_days, "processed_at": lead.processed_at,
         }, timeout=15)
-        return r.status_code < 300
+        if r.status_code >= 300:
+            logger.error(f"Make.com error [{r.status_code}]: {r.text[:300]}")
+            return False
+        return True
     except Exception as e:
-        logger.error(f"Make.com error: {e}"); return False
+        logger.error(f"Make.com error: {type(e).__name__}: {e}"); return False
 
 async def save_to_supabase(client: httpx.AsyncClient, lead: LeadOutput) -> bool:
     """
@@ -864,9 +985,10 @@ def _score_place(place: dict) -> tuple[bool, list[str]]:
 
     signals = []
 
-    # Signal 1: low rating (struggling reputation = pain point)
-    if rating and float(rating) <= PLACES_MIN_RATING:
-        signals.append(f"{rating}★ rating ({review_count} reviews)")
+    # Signal 1: strictly under 4.0 stars AND not a high-volume established business
+    if rating and float(rating) < 4.0:
+        if review_count < PLACES_MIN_REVIEWS_FOR_RATING:
+            signals.append(f"{rating}★ rating ({review_count} reviews)")
 
     # Signal 2: no website (zero digital presence)
     if not website:
@@ -1106,6 +1228,7 @@ async def run_pipeline(test_mode: bool = False):
 
     async with _pipeline_lock:
         start = time.monotonic()
+        await ensure_schema_safe()   # ← auto-create any missing columns before anything runs
         logger.info("=" * 60)
         logger.info("🚀 VERSAL DIGITAL SOLUTIONS — LEAN LEAD MACHINE v7")
         logger.info(f"   Gemini model: {GEMINI_MODEL}")
