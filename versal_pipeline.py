@@ -675,7 +675,10 @@ def scrape_reddit(since_date: str) -> list[dict]:
         try:
             posts = _apify_run("trudax/reddit-scraper-lite", {
                 "startUrls": [{"url": f"https://www.reddit.com/r/{sub}/new/"}],
-                "maxPostCount": 30, "maxCommentCount": 0, "afterDate": since_date,
+                "maxPostCount": 15,     # lowered — free tier caps around here anyway
+                "maxCommentCount": 0,
+                "afterDate": since_date,
+                "includeComments": False,
             })
         except Exception as e:
             logger.error(f"Reddit r/{sub} error: {e}"); time.sleep(2); continue
@@ -937,7 +940,7 @@ async def scrape_google_places() -> list[dict]:
 
     total     = len(GOOGLE_PLACES_SEARCHES)
     skipped   = total - len(remaining)
-    logger.info(f"  Google Places: {remaining and len(remaining)}/{total} searches remaining "
+    logger.info(f"  Google Places: {len(remaining)}/{total} searches remaining "
                 f"({skipped} already done across previous runs)")
 
     if not remaining:
@@ -1146,11 +1149,13 @@ async def run_pipeline(test_mode: bool = False):
         else:
             since_date = await get_last_run_date()
             raw_items  = []
+            # ── Google FIRST — free $200/month credit, most reliable, no Apify needed ──
+            if ACTIVE_PLATFORMS.get("google"):     raw_items += await scrape_google_places()
+            # ── Apify-based platforms after ──
             if ACTIVE_PLATFORMS.get("facebook"):   raw_items += scrape_facebook_groups(since_date)
             if ACTIVE_PLATFORMS.get("reddit"):     raw_items += scrape_reddit(since_date)
             if ACTIVE_PLATFORMS.get("tiktok"):     raw_items += scrape_tiktok()
             if ACTIVE_PLATFORMS.get("instagram"):  raw_items += scrape_instagram()
-            if ACTIVE_PLATFORMS.get("google"):     raw_items += await scrape_google_places()
             if ACTIVE_PLATFORMS.get("trustpilot"): raw_items += scrape_trustpilot()
             if ACTIVE_PLATFORMS.get("yelp"):       raw_items += scrape_yelp()
 
@@ -1227,11 +1232,14 @@ async def run_pipeline(test_mode: bool = False):
                 pending_leads.append(lead)
 
                 # Slack + Make fire instantly per lead (non-blocking)
-                asyncio.create_task(asyncio.gather(
-                    send_to_slack(httpx.AsyncClient(), lead),
-                    send_to_make(httpx.AsyncClient(), lead),
-                    return_exceptions=True,
-                ))
+                async def _notify(l=lead):
+                    async with httpx.AsyncClient() as c:
+                        await asyncio.gather(
+                            send_to_slack(c, l),
+                            send_to_make(c, l),
+                            return_exceptions=True,
+                        )
+                asyncio.create_task(_notify())
 
                 # Flush to Supabase/dashboard every BATCH_SAVE_EVERY leads
                 if len(pending_leads) >= BATCH_SAVE_EVERY:
